@@ -14,6 +14,7 @@ os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype")
 
 import sys
 import cv2
+import numpy as np
 from pathlib import Path
 from ultralytics import YOLO
 
@@ -95,15 +96,32 @@ def main():
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback(window_name, mouse_callback)
 
+    infer_every = int(cfg.get("grasp_pipeline", {}).get("infer_every_live", 3))
+    table_z_m = float(cfg.get("grasp_pipeline", {}).get("grasp", {}).get("table_z_m", 0.0))
+    frame_index = 0
+    last_results = None
+
     try:
         while True:
             color_image, depth_mm = cam.get_frame()
             if color_image is None:
                 continue
 
-            results = model.predict(color_image, verbose=False, device=device)
+            frame_index += 1
 
-            for r in results:
+            if frame_index % infer_every == 0 or last_results is None:
+                last_results = model.predict(color_image, verbose=False, device=device)
+
+            # Mock T_cam2base for 2D ray-plane intersection
+            T_cam2base_mock = np.eye(4, dtype=np.float32)
+            T_cam2base_mock[:3, :3] = np.array([
+                [ 1,  0,  0],
+                [ 0, -1,  0],
+                [ 0,  0, -1]
+            ])
+            T_cam2base_mock[2, 3] = 0.5
+
+            for r in last_results:
                 for box in r.boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
                     cls_id, conf = int(box.cls[0]), float(box.conf[0])
@@ -120,6 +138,26 @@ def main():
                             x_m = (u - cx) * z_m / fx
                             y_m = (v - cy) * z_m / fy
                             valid_depth = True
+                    else:
+                        # 2D Planar Assumption using Ray-Plane Intersection
+                        dx = (u - cx) / fx
+                        dy = (v - cy) / fy
+                        dz = 1.0
+                        dir_c = np.array([dx, dy, dz, 0.0], dtype=np.float32)
+                        orig_c = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+                        
+                        dir_b = T_cam2base_mock @ dir_c
+                        orig_b = T_cam2base_mock @ orig_c
+                        
+                        if abs(dir_b[2]) > 1e-6:
+                            t = (table_z_m - orig_b[2]) / dir_b[2]
+                            if t > 0:
+                                point_b = orig_b + t * dir_b
+                                point_c = np.linalg.inv(T_cam2base_mock) @ point_b
+                                z_m = float(point_c[2])
+                                x_m = (u - cx) * z_m / fx
+                                y_m = (v - cy) * z_m / fy
+                                valid_depth = True
 
                     if valid_depth:
                         cv2.rectangle(color_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -139,21 +177,36 @@ def main():
 
             # Point sampling
             cu, cv_y = clicked_point["u"], clicked_point["v"]
-            if cu != -1 and cv_y != -1 and depth_mm is not None:
-                h_dm, w_dm = depth_mm.shape
-                if 0 <= cu < w_dm and 0 <= cv_y < h_dm:
-                    cz_mm = get_depth_mm(depth_mm, cu, cv_y)
-                    if cz_mm > 0:
-                        cz_m = cz_mm / 1000.0
-                        cx_m = (cu - cx) * cz_m / fx
-                        cy_m = (cv_y - cy) * cz_m / fy
-                        cv2.drawMarker(color_image, (cu, cv_y), (255, 0, 255),
-                                       cv2.MARKER_CROSS, 20, 2)
-                        test_label = f"TEST -> X:{cx_m:.3f} Y:{cy_m:.3f} Z:{cz_m:.3f} m"
-                        cv2.rectangle(color_image, (cu + 5, cv_y - 25),
-                                      (cu + 320, cv_y + 5), (0, 0, 0), -1)
-                        cv2.putText(color_image, test_label, (cu + 10, cv_y - 5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+            if cu != -1 and cv_y != -1:
+                z_m = None
+                if depth_mm is not None:
+                    h_dm, w_dm = depth_mm.shape
+                    if 0 <= cu < w_dm and 0 <= cv_y < h_dm:
+                        cz_mm = get_depth_mm(depth_mm, cu, cv_y)
+                        if cz_mm > 0:
+                            z_m = cz_mm / 1000.0
+                else:
+                    dx = (cu - cx) / fx
+                    dy = (cv_y - cy) / fy
+                    dz = 1.0
+                    dir_c = np.array([dx, dy, dz, 0.0], dtype=np.float32)
+                    orig_c = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+                    dir_b = T_cam2base_mock @ dir_c
+                    orig_b = T_cam2base_mock @ orig_c
+                    if abs(dir_b[2]) > 1e-6:
+                        t = (table_z_m - orig_b[2]) / dir_b[2]
+                        if t > 0:
+                            point_b = orig_b + t * dir_b
+                            point_c = np.linalg.inv(T_cam2base_mock) @ point_b
+                            z_m = float(point_c[2])
+                
+                if z_m is not None:
+                    cx_m = (cu - cx) * z_m / fx
+                    cy_m = (cv_y - cy) * z_m / fy
+                    cv2.drawMarker(color_image, (cu, cv_y), (255, 0, 255), cv2.MARKER_CROSS, 20, 2)
+                    test_label = f"TEST -> X:{cx_m:.3f} Y:{cy_m:.3f} Z:{z_m:.3f} m"
+                    cv2.rectangle(color_image, (cu + 5, cv_y - 25), (cu + 320, cv_y + 5), (0, 0, 0), -1)
+                    cv2.putText(color_image, test_label, (cu + 10, cv_y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
             cv2.putText(color_image, f"{cam_type.upper()} | {model_name.upper()}",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)

@@ -13,10 +13,12 @@ Usage:
 import os
 os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype")
 
+import argparse
 import sys
 from pathlib import Path
 
 import cv2
+import numpy as np
 from ultralytics import YOLO
 
 
@@ -55,11 +57,16 @@ def print_best_grasp(grasp) -> None:
 
 
 def main():
-    config_path = PROJECT_ROOT / "config" / "default.yaml"
+    parser = argparse.ArgumentParser(description="Ordinary Grasp Test")
+    parser.add_argument("--config", default="config/default.yaml", help="Path to config file")
+    args = parser.parse_args()
+
+    config_path = PROJECT_ROOT / args.config
     models_dir = PROJECT_ROOT / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = load_config(config_path)
+
     cam_type = str(cfg.get("camera", {}).get("type", "")).lower()
     yolo_cfg = cfg.get("yolo", {})
     det_cfg = cfg.get("detection", {})
@@ -72,6 +79,7 @@ def main():
     conf_thres = float(det_cfg.get("conf_threshold", 0.25))
     iou_thres = float(det_cfg.get("iou_threshold", 0.45))
     depth_quantile = float(grasp_cfg.get("depth_quantile", 0.75))
+    table_z_m = float(grasp_cfg.get("table_z_m", 0.0))
 
     print("=== Init YOLO ===")
     model_path = models_dir / model_name
@@ -95,25 +103,61 @@ def main():
     cv2.setMouseCallback(window_name, mouse_callback)
     print("\n[Keys] Left click=sample depth  G=print best  Q=quit")
 
+    infer_every = int(cfg.get("grasp_pipeline", {}).get("infer_every_live", 3))
+    frame_index = 0
+    last_grasps = []
+    last_results = None
+
     try:
         while True:
             color_image, depth_mm = cam.get_frame()
-            if color_image is None or depth_mm is None:
+            
+            # [MODIFICATION]: We removed `or depth_mm is None` here. 
+            # A 2D webcam doesn't have a physical depth sensor, so it always returns None.
+            # If we kept that check, the code would throw away every frame and freeze in an infinite loop!
+            if color_image is None:
                 continue
 
-            results = model.predict(
-                color_image,
-                verbose=False,
-                device=device,
-                conf=conf_thres,
-                iou=iou_thres,
-            )
+            frame_index += 1
 
-            grasps = estimate_grasps(results, depth_mm, K, depth_quantile=depth_quantile)
-            for grasp in grasps:
+            # [MODIFICATION]: FRAME SKIPPING LOGIC
+            # YOLO models take heavy CPU math to run. If we run it on every single frame, 
+            # the camera feed drops to 5 FPS and the keyboard stops responding because the CPU is maxed out.
+            # By checking `frame_index % infer_every == 0`, we only run YOLO every 3rd frame!
+            # The other frames just skip this block and instantly re-draw the old `last_grasps`.
+            if frame_index % infer_every == 0 or last_results is None:
+                last_results = model.predict(
+                    color_image,
+                    verbose=False,
+                    device=device,
+                    conf=conf_thres,
+                    iou=iou_thres,
+                )
+
+                # [MODIFICATION]: MOCK 3D TRANSFORM
+                # The grasping math (estimate_grasps) physically requires knowing where the camera is
+                # in 3D space to calculate the ray-plane intersection. 
+                # Since this script runs without the physical robot arm connected, we feed it a "fake" 
+                # transform matrix simulating a camera hovering exactly 0.5 meters above the table looking straight down.
+                T_cam2base_mock = np.eye(4, dtype=np.float32)
+                T_cam2base_mock[:3, :3] = np.array([
+                    [ 1,  0,  0],
+                    [ 0, -1,  0],
+                    [ 0,  0, -1]
+                ])
+                T_cam2base_mock[2, 3] = 0.5
+
+                last_grasps = estimate_grasps(
+                    last_results, depth_mm, K, 
+                    depth_quantile=depth_quantile, 
+                    T_cam2base=T_cam2base_mock, 
+                    table_z_m=table_z_m
+                )
+
+            for grasp in last_grasps:
                 draw_grasp(color_image, grasp)
 
-            best = select_best_grasp(grasps)
+            best = select_best_grasp(last_grasps)
             if best is not None:
                 x_m, y_m, z_m = best.position.tolist()
                 best_text = (
@@ -132,9 +176,26 @@ def main():
 
             cu, cv_y = clicked_point["u"], clicked_point["v"]
             if cu >= 0 and cv_y >= 0:
-                z_mm = get_depth_mm(depth_mm, cu, cv_y, 5)
+                z_mm = get_depth_mm(depth_mm, cu, cv_y, 5) if depth_mm is not None else 0.0
+                z_m = None
                 if z_mm > 0:
                     z_m = z_mm / 1000.0
+                else:
+                    dx = (cu - cx) / fx
+                    dy = (cv_y - cy) / fy
+                    dz = 1.0
+                    dir_c = np.array([dx, dy, dz, 0.0], dtype=np.float32)
+                    orig_c = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+                    dir_b = T_cam2base_mock @ dir_c
+                    orig_b = T_cam2base_mock @ orig_c
+                    if abs(dir_b[2]) > 1e-6:
+                        t = (table_z_m - orig_b[2]) / dir_b[2]
+                        if t > 0:
+                            point_b = orig_b + t * dir_b
+                            point_c = np.linalg.inv(T_cam2base_mock) @ point_b
+                            z_m = float(point_c[2])
+
+                if z_m is not None:
                     x_m = (cu - cx) * z_m / fx
                     y_m = (cv_y - cy) * z_m / fy
                     cv2.drawMarker(color_image, (cu, cv_y), (255, 0, 255), cv2.MARKER_CROSS, 18, 2)

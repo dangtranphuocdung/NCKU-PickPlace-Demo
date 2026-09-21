@@ -70,10 +70,11 @@ def _cam_to_base(T_hand_eye: np.ndarray, grasp_driver: GraspDriver, cfg: dict[st
 def _execute_grasp(
     controller: RebotArmEndPose,
     grasp_driver: GraspDriver,
-    grasp6d: tuple[float, ...],
-    pre6d: tuple[float, ...],
-    ready_cfg: dict[str, Any],
-    dry_run: bool,
+    grasp6d: tuple[float, float, float, float, float, float],
+    pre6d: tuple[float, float, float, float, float, float],
+    ready_cfg: dict,
+    dry_run: bool = False,
+    jaw_width_m: float = 0.02,
 ) -> bool:
     xg, yg, zg, rxg, ryg, rzg = grasp6d
     xp, yp, zp, rxp, ryp, rzp = pre6d
@@ -85,8 +86,8 @@ def _execute_grasp(
         print("[Grasp] dry run; skip motion")
         return False
 
-    print("[Grasp] Open gripper")
-    grasp_driver.open_gripper()
+    print(f"[Grasp] Open gripper to {jaw_width_m * 100:.1f}cm (+ padding)")
+    grasp_driver.open_gripper(distance_m=jaw_width_m + 0.02)
 
     print("[Grasp] Move to pregrasp")
     if not controller.move_to_traj(xp, yp, zp, rxp, ryp, rzp, duration=2.0):
@@ -207,6 +208,7 @@ def main() -> int:
         model_name = yolo_cfg.get("model_name", "yoloe-26s-seg.pt")
         pregrasp_offset_m = float(grasp_cfg.get("pregrasp_offset_m", 0.08))
         depth_quantile = float(grasp_cfg.get("depth_quantile", 0.75))
+        table_z_m = float(grasp_cfg.get("table_z_m", 0.0))
         infer_every = max(1, int(gp_cfg.get("infer_every_live", 2)))
 
         print(f"=== Load YOLO: {model_name} ===")
@@ -231,7 +233,7 @@ def main() -> int:
 
         while True:
             color_bgr, depth_mm = cam.get_frame()
-            if color_bgr is None or depth_mm is None:
+            if color_bgr is None:
                 continue
 
             frame_index += 1
@@ -250,7 +252,24 @@ def main() -> int:
                     conf=float(yolo_opts.get("conf", 0.25)),
                     iou=float(yolo_opts.get("iou", 0.45)),
                 )
-                last_grasps = estimate_grasps(last_results, depth_mm, K, depth_quantile=depth_quantile)
+                
+                # [MODIFICATION]: Live Kinematics
+                # Because we don't have a 3D camera, we need to know exactly where the camera 
+                # is in 3D space so our ray-plane intersection math works.
+                # Here, we ask the robot's motors (grasp_driver) for their exact live coordinates 
+                # and combine it with the hand-eye calibration (T_hand_eye) to get T_cam2base_live.
+                T_cam2base_live = None
+                if T_hand_eye is not None and robot_ready:
+                    T_cam2base_live = _cam_to_base(T_hand_eye, grasp_driver, cfg)
+                    
+                # [MODIFICATION]: We then pass T_cam2base_live and table_z_m down to the estimator
+                # so it can do the ray-plane intersection.
+                last_grasps = estimate_grasps(
+                    last_results, depth_mm, K, 
+                    depth_quantile=depth_quantile, 
+                    T_cam2base=T_cam2base_live, 
+                    table_z_m=table_z_m
+                )
 
             status = f"{'FROZEN' if frozen else 'LIVE'} {fps_value:.1f}fps | G=grasp R=resume Q=quit"
             best_live = select_best_grasp(last_grasps)
@@ -274,7 +293,7 @@ def main() -> int:
             if key in (ord("g"), ord("G")):
                 print("\n[G] Capture and estimate grasp")
                 snap_color, snap_depth = cam.get_frame()
-                if snap_color is None or snap_depth is None:
+                if snap_color is None:
                     print("[G] Frame capture failed")
                     continue
 
@@ -285,7 +304,17 @@ def main() -> int:
                     conf=float(yolo_opts.get("conf", 0.25)),
                     iou=float(yolo_opts.get("iou", 0.45)),
                 )
-                snap_grasps = estimate_grasps(snap_results, snap_depth, K, depth_quantile=depth_quantile)
+                
+                T_cam2base_snap = None
+                if T_hand_eye is not None and robot_ready:
+                    T_cam2base_snap = _cam_to_base(T_hand_eye, grasp_driver, cfg)
+                    
+                snap_grasps = estimate_grasps(
+                    snap_results, snap_depth, K, 
+                    depth_quantile=depth_quantile, 
+                    T_cam2base=T_cam2base_snap, 
+                    table_z_m=table_z_m
+                )
                 best = select_best_grasp(snap_grasps)
                 if best is None:
                     print("[G] No valid grasp")
@@ -310,7 +339,10 @@ def main() -> int:
                     T_cam2base,
                     pregrasp_offset_m,
                 )
-                _execute_grasp(controller, grasp_driver, grasp6d, pre6d, ready_cfg, dry_run=args.dry_run)
+                _execute_grasp(
+                    controller, grasp_driver, grasp6d, pre6d, ready_cfg, 
+                    dry_run=args.dry_run, jaw_width_m=best.jaw_width_m
+                )
 
     finally:
         print("\n[Exit] Release gripper and home")

@@ -51,14 +51,16 @@ def get_depth_mm(depth_map: np.ndarray, u: int, v: int, roi_size: int = 5) -> fl
 
 def estimate_grasps(
     results: list[Any],
-    depth_mm: np.ndarray,
+    depth_mm: Optional[np.ndarray],
     K: np.ndarray,
     depth_quantile: float = 0.75,
+    T_cam2base: Optional[np.ndarray] = None,
+    table_z_m: float = 0.0,
 ) -> list[GraspPose]:
     grasps: list[GraspPose] = []
     for result in results:
         for index in range(detection_count(result)):
-            grasps.append(estimate_grasp(result, index, depth_mm, K, depth_quantile=depth_quantile))
+            grasps.append(estimate_grasp(result, index, depth_mm, K, depth_quantile=depth_quantile, T_cam2base=T_cam2base, table_z_m=table_z_m))
     return grasps
 
 
@@ -98,15 +100,17 @@ def draw_grasp(image: np.ndarray, grasp: GraspPose) -> None:
 def estimate_grasp(
     result: Any,
     index: int,
-    depth_mm: np.ndarray,
+    depth_mm: Optional[np.ndarray],
     K: np.ndarray,
     depth_quantile: float = 0.75,
+    T_cam2base: Optional[np.ndarray] = None,
+    table_z_m: float = 0.0,
 ) -> GraspPose:
     class_name, conf, bbox_xyxy = _detection_meta(result, index)
-    rect_points = _rect_points(result, index, depth_mm.shape, bbox_xyxy)
+    rect_points = _rect_points(result, index, (720, 1280) if depth_mm is None else depth_mm.shape, bbox_xyxy)
     center = rect_points.mean(axis=0).astype(np.float32)
 
-    mask = _depth_mask(result, index, depth_mm.shape, rect_points)
+    mask = _depth_mask(result, index, (720, 1280) if depth_mm is None else depth_mm.shape, rect_points)
     short_vec_uv, short_len_px = _short_edge(rect_points)
     short_dir_uv = _normalize(short_vec_uv)
     edge_lengths = [float(np.linalg.norm(rect_points[(i + 1) % 4] - rect_points[i])) for i in range(4)]
@@ -120,14 +124,49 @@ def estimate_grasp(
             center, short_edge_points, grasp_span_px = refined
 
     center_px = (int(round(float(center[0]))), int(round(float(center[1]))))
-    depth_values = depth_mm[mask > 0]
-    depth_values = depth_values[depth_values > 0]
-    if len(depth_values) == 0:
-        center_depth = get_depth_mm(depth_mm, center_px[0], center_px[1], 5)
-        if center_depth > 0:
-            depth_values = np.array([center_depth], dtype=np.float32)
+    
+    z_m = None
+    depth_values = np.array([])
+    if depth_mm is not None:
+        depth_values = depth_mm[mask > 0]
+        depth_values = depth_values[depth_values > 0]
+        if len(depth_values) == 0:
+            center_depth = get_depth_mm(depth_mm, center_px[0], center_px[1], 5)
+            if center_depth > 0:
+                depth_values = np.array([center_depth], dtype=np.float32)
+                
+    if len(depth_values) > 0:
+        depth_quantile = float(np.clip(depth_quantile, 0.0, 1.0))
+        z_m = float(np.quantile(depth_values, depth_quantile) / 1000.0)
+    elif T_cam2base is not None:
+        # [MODIFICATION]: 2D Planar Assumption using Ray-Plane Intersection
+        # Because we only have a 2D webcam, `depth_values` will be empty.
+        # So instead of reading a depth sensor, we use high school geometry:
+        
+        # 1. Create a 3D ray originating from the camera lens (0,0,0) and passing through the pixel
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+        dx = (center[0] - cx) / fx
+        dy = (center[1] - cy) / fy
+        dz = 1.0
+        dir_c = np.array([dx, dy, dz, 0.0], dtype=np.float32) # Direction of the ray
+        orig_c = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32) # Origin of the ray
+        
+        # 2. Transform this camera-relative ray into the robot's physical base coordinate system
+        dir_b = T_cam2base @ dir_c
+        orig_b = T_cam2base @ orig_c
+        
+        # 3. Find exactly where this ray intersects the table (Z = table_z_m)
+        if abs(dir_b[2]) > 1e-6:
+            t = (table_z_m - orig_b[2]) / dir_b[2] # Distance along the ray to the table
+            if t > 0:
+                point_b = orig_b + t * dir_b # The exact 3D point on the table in Robot coordinates
+                
+                # 4. Project that 3D point BACK into the camera's coordinate system to get the true camera depth (z_m)
+                point_c = np.linalg.inv(T_cam2base) @ point_b
+                z_m = float(point_c[2])
 
-    if len(depth_values) == 0 or short_dir_uv is None:
+    if z_m is None or short_dir_uv is None:
         return GraspPose(
             class_name=class_name,
             conf=conf,
@@ -142,11 +181,9 @@ def estimate_grasp(
             rect_points=rect_points,
             short_edge_points=short_edge_points,
             valid_depth_pixels=int(len(depth_values)),
-            rejected_reason="no_valid_depth_or_rect",
+            rejected_reason="no_valid_depth_or_rect_or_ray_intersection",
         )
 
-    depth_quantile = float(np.clip(depth_quantile, 0.0, 1.0))
-    z_m = float(np.quantile(depth_values, depth_quantile) / 1000.0)
     position = _backproject(float(center[0]), float(center[1]), z_m, K)
     approach = _normalize(-position)
     if approach is None:

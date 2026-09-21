@@ -1,13 +1,15 @@
 camera:
-  type: orbbec_gemini2
+  type: webcam
+  id: 4
   serial: null
   color_width: 1280
   color_height: 720
   fps: 30
+  intrinsics_file: "config/calibration/webcam/intrinsics_test_1.npz"
 
 calibration:
   aruco:
-    marker_length_m: 0.1
+    marker_length_m: 0.092
     dict_id: 0
     target_marker_id: 0
   hand_eye_method: TSAI
@@ -17,7 +19,7 @@ calibration:
     z: -0.02
 
 detection:
-  conf_threshold: 0.5
+  conf_threshold: 0.50
   iou_threshold: 0.45
 
 robot:
@@ -45,19 +47,19 @@ robot:
 
 yolo:
   model_name: "yoloe-26l-seg.pt"
-  device: "cpu"
+  device: "cpu" #Original cpu
   use_world: true
   custom_classes:
-    - "yellow banana"
     - "water bottle"
-    - "light blue coffee cup"
-    - "cup"
-    - "green object"
-    - "tool"
+    - "yellow screwdriver"
+    - "human hand"
+    - "black leather wallet"
+    - "black, tall 3D printed Y-shape object"
 
 grasp_pipeline:
-  infer_every_live: 3
+  infer_every_live: 1
   grasp:
+    table_z_m: 0.02
     depth_quantile: 0.5
     pregrasp_offset_m: 0.080
     insertion_depth_m: 0.015

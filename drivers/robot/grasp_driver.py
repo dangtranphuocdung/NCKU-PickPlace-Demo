@@ -32,7 +32,7 @@ _CAMERAWS_ROOT = Path(__file__).resolve().parents[2]
 _REBOT_REPO_NAME = "reBotArm_control_py"
 _DEFAULT_REBOT_REPO = _CAMERAWS_ROOT / "sdk" / _REBOT_REPO_NAME
 
-GRIPPER_MAX_DISTANCE_M = 0.02
+GRIPPER_MAX_DISTANCE_M = 0.09
 
 
 @dataclass(frozen=True)

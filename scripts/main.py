@@ -102,7 +102,8 @@ def _execute_grasp(
     _wait_motion(controller, 1.5)
 
     print("[Grasp] Closing")
-    ok = grasp_driver.grasp()
+    target_jaw_width = max(0.0, 0.01)
+    ok = grasp_driver.open_gripper(distance_m=target_jaw_width)
     print("[Grasp] Holding object" if ok else "[Grasp] Empty grasp")
 
     print("[Grasp] Return ready")
@@ -196,7 +197,8 @@ def main() -> int:
         K = cam.K.astype(np.float32)
 
         cam_type = str(cam_cfg.get("type", "")).lower()
-        T_hand_eye, hand_eye_mode = load_hand_eye(PROJECT_ROOT, cam_type)
+        hand_eye_filename = cfg.get("calibration", {}).get("hand_eye_file", "hand_eye.npz")
+        T_hand_eye, hand_eye_mode = load_hand_eye(PROJECT_ROOT, cam_type, hand_eye_filename)
         if T_hand_eye is None or hand_eye_mode != "eye_in_hand":
             print("[WARN] Hand-eye calibration unavailable; grasp execution disabled")
             T_hand_eye = None

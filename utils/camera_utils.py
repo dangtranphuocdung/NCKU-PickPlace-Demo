@@ -23,8 +23,8 @@ def load_config(path: str | Path) -> dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def load_hand_eye(project_root: str | Path, cam_type: str) -> tuple[Optional[np.ndarray], Optional[str]]:
-    hand_eye_path = Path(project_root) / "config" / "calibration" / str(cam_type).lower() / "hand_eye.npz"
+def load_hand_eye(project_root: str | Path, cam_type: str, filename: str = "hand_eye.npz") -> tuple[Optional[np.ndarray], Optional[str]]:
+    hand_eye_path = Path(project_root) / "config" / "calibration" / str(cam_type).lower() / filename
     if not hand_eye_path.exists():
         return None, None
 

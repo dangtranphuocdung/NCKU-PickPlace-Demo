@@ -308,7 +308,7 @@ def main():
     calib_dir  = root / "config" / "calibration" / cam_type
     aruco_cfg  = cfg["calibration"]["aruco"]
     he_method  = cfg["calibration"].get("hand_eye_method", "TSAI")
-    save_path  = calib_dir / "hand_eye_test_2.npz"
+    save_path  = calib_dir / "hand_eye_test_manually.npz"
 
     # Camera.
     cam = make_camera(cfg)

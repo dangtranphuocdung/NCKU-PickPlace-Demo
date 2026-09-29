@@ -8,14 +8,15 @@ camera:
   intrinsics_file: "config/calibration/webcam/intrinsics_test_1.npz"
 
 calibration:
+  hand_eye_file: "hand_eye.npz"
   aruco:
-    marker_length_m: 0.092
+    marker_length_m: 0.093
     dict_id: 0
     target_marker_id: 0
   hand_eye_method: TSAI
   hand_eye_compensation_m:
-    x: 0.00
-    y: 0.0
+    x: -0.02
+    y: 0.00
     z: -0.02
 
 detection:
@@ -26,7 +27,7 @@ robot:
   repo_root: null
   gripper:
     dm:
-      angle_open: 5.0
+      angle_open: 4.0
       counterclockwise: true
       tau_max: 1.5
       close_torque: 1.0
@@ -55,13 +56,14 @@ yolo:
     - "human hand"
     - "black leather wallet"
     - "black, tall 3D printed Y-shape object"
+    - "a roll of black tape"
 
 grasp_pipeline:
-  infer_every_live: 1
+  infer_every_live: 3
   grasp:
-    table_z_m: 0.02
+    table_z_m: 0.05
     depth_quantile: 0.5
-    pregrasp_offset_m: 0.080
+    pregrasp_offset_m: 0.150
     insertion_depth_m: 0.015
     min_base_z_m: 0.00
 

@@ -28,7 +28,7 @@ def main():
     parser = argparse.ArgumentParser(description="Visually verify camera calibration")
     parser.add_argument("--file", default="config/calibration/webcam/intrinsics_test_1.npz", 
                         help="Path to the intrinsics.npz file")
-    parser.add_argument("--camera-id", default=0, help="Camera device ID or path")
+    parser.add_argument("--camera-id", default=4, help="Camera device ID or path")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     args = parser.parse_args()

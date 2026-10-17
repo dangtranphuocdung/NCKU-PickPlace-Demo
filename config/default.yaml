@@ -15,10 +15,9 @@ calibration:
     target_marker_id: 0
   hand_eye_method: TSAI
   hand_eye_compensation_m:
-    x: -0.02
-    y: 0.00
-    z: -0.02
-
+    x: 0.01    #0.01
+    y: 0.005
+    z: 0.00
 detection:
   conf_threshold: 0.50
   iou_threshold: 0.45
@@ -41,32 +40,29 @@ robot:
   ready_pose:
     x: 0.3
     y: 0.0
-    z: 0.3
+    z: 0.28
     roll: 0.0
-    pitch: 0.7
+    pitch: 0.6
     duration: 3.0
 
 yolo:
   model_name: "yoloe-26l-seg.pt"
-  device: "cpu" #Original cpu
+  device: "0" #Original cpu
   use_world: true
   custom_classes:
-    - "water bottle"
     - "yellow screwdriver"
-    - "human hand"
-    - "black leather wallet"
-    - "black, tall 3D printed Y-shape object"
-    - "a roll of black tape"
-
+    - "blue cap with transparent centrifuge tube inside a container"
+  #  - "glasses"
+  #  - "bottle"
+    - "blue cube"
 grasp_pipeline:
-  infer_every_live: 3
+  infer_every_live: 1
   grasp:
-    table_z_m: 0.05
+    table_z_m: 0.16
     depth_quantile: 0.5
     pregrasp_offset_m: 0.150
-    insertion_depth_m: 0.015
+    insertion_depth_m: 0.00
     min_base_z_m: 0.00
-
 graspnet:
   checkpoint: "checkpoint-rs.tar"
   num_point: 20000

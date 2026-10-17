@@ -102,7 +102,8 @@ def _execute_grasp(
     _wait_motion(controller, 1.5)
 
     print("[Grasp] Closing")
-    target_jaw_width = max(0.0, 0.01)
+    grip_tightness = 0.001
+    target_jaw_width = max(0.0, jaw_width_m-0.01)
     ok = grasp_driver.open_gripper(distance_m=target_jaw_width)
     print("[Grasp] Holding object" if ok else "[Grasp] Empty grasp")
 
@@ -209,6 +210,7 @@ def main() -> int:
 
         model_name = yolo_cfg.get("model_name", "yoloe-26s-seg.pt")
         pregrasp_offset_m = float(grasp_cfg.get("pregrasp_offset_m", 0.08))
+        insertion_depth_m = float(grasp_cfg.get("insertion_depth_m", 0.0))
         depth_quantile = float(grasp_cfg.get("depth_quantile", 0.75))
         table_z_m = float(grasp_cfg.get("table_z_m", 0.0))
         infer_every = max(1, int(gp_cfg.get("infer_every_live", 2)))
@@ -292,6 +294,44 @@ def main() -> int:
                 last_display = None
                 continue
 
+            if key in (ord("c"), ord("C")):
+                print("\n[C] MACRO SHOT: Centering over object...")
+                snap_color, snap_depth = cam.get_frame()
+                if snap_color is None:
+                    continue
+                snap_results = model.predict(
+                    snap_color, verbose=False, device=yolo_opts.get("device", "cpu"),
+                    conf=float(yolo_opts.get("conf", 0.25)), iou=float(yolo_opts.get("iou", 0.45))
+                )
+                if T_hand_eye is None or not robot_ready:
+                    print("[C] Hand-eye calibration unavailable")
+                    continue
+                T_cam2base_snap = _cam_to_base(T_hand_eye, grasp_driver, cfg)
+                snap_grasps = estimate_grasps(
+                    snap_results, snap_depth, K, depth_quantile=depth_quantile, 
+                    T_cam2base=T_cam2base_snap, table_z_m=table_z_m
+                )
+                best_macro = select_best_grasp(snap_grasps)
+                if best_macro is None:
+                    print("[C] No object found to center on!")
+                    continue
+                
+                macro_grasp6d, macro_pre6d = transform_grasp_pose_to_base(
+                    best_macro.position, best_macro.tcp_rotation, T_cam2base_snap, pregrasp_offset_m, insertion_depth_m
+                )
+                if not args.dry_run:
+                    controller.move_to_traj(
+                        x=macro_grasp6d[0] - 0.15, 
+                        y=macro_grasp6d[1], 
+                        z=float(ready_cfg.get("z", 0.25)),
+                        roll=float(ready_cfg.get("roll", 0.0)),
+                        pitch=float(ready_cfg.get("pitch", 0.7)),
+                        yaw=float(ready_cfg.get("yaw", 0.0)),
+                        duration=3.0
+                    )
+                    print("[C] Centering movement started. Please wait 2 seconds, then press G for precision grasp!")
+                continue
+
             if key in (ord("g"), ord("G")):
                 print("\n[G] Capture and estimate grasp")
                 snap_color, snap_depth = cam.get_frame()
@@ -340,6 +380,7 @@ def main() -> int:
                     best.tcp_rotation,
                     T_cam2base,
                     pregrasp_offset_m,
+                    insertion_depth_m,
                 )
                 _execute_grasp(
                     controller, grasp_driver, grasp6d, pre6d, ready_cfg, 

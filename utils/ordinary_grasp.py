@@ -108,9 +108,12 @@ def estimate_grasp(
 ) -> GraspPose:
     class_name, conf, bbox_xyxy = _detection_meta(result, index)
     rect_points = _rect_points(result, index, (720, 1280) if depth_mm is None else depth_mm.shape, bbox_xyxy)
+    img_shape = depth_mm.shape if depth_mm is not None else tuple(result.orig_shape[:2])
+    rect_points = _rect_points(result, index, img_shape, bbox_xyxy)
     center = rect_points.mean(axis=0).astype(np.float32)
 
     mask = _depth_mask(result, index, (720, 1280) if depth_mm is None else depth_mm.shape, rect_points)
+    mask = _depth_mask(result, index, img_shape, rect_points)
     short_vec_uv, short_len_px = _short_edge(rect_points)
     short_dir_uv = _normalize(short_vec_uv)
     edge_lengths = [float(np.linalg.norm(rect_points[(i + 1) % 4] - rect_points[i])) for i in range(4)]

@@ -14,6 +14,7 @@ os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype")
 
 import sys
 import cv2
+import time
 import numpy as np
 from pathlib import Path
 from ultralytics import YOLO
@@ -100,6 +101,9 @@ def main():
     table_z_m = float(cfg.get("grasp_pipeline", {}).get("grasp", {}).get("table_z_m", 0.0))
     frame_index = 0
     last_results = None
+    fps_start_time = time.time()
+    fps_frame_count = 0
+    current_fps = 0.0
 
     try:
         while True:
@@ -108,6 +112,13 @@ def main():
                 continue
 
             frame_index += 1
+            
+            fps_frame_count += 1
+            now = time.time()
+            if now - fps_start_time >= 1.0:
+                current_fps = fps_frame_count / (now - fps_start_time)
+                fps_frame_count = 0
+                fps_start_time = now
 
             if frame_index % infer_every == 0 or last_results is None:
                 last_results = model.predict(color_image, verbose=False, device=device)
@@ -208,7 +219,7 @@ def main():
                     cv2.rectangle(color_image, (cu + 5, cv_y - 25), (cu + 320, cv_y + 5), (0, 0, 0), -1)
                     cv2.putText(color_image, test_label, (cu + 10, cv_y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
-            cv2.putText(color_image, f"{cam_type.upper()} | {model_name.upper()}",
+            cv2.putText(color_image, f"{cam_type.upper()} | {model_name.upper()} | FPS: {current_fps:.1f}",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             cv2.imshow(window_name, color_image)
 

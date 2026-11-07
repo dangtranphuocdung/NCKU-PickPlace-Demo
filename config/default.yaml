@@ -1,11 +1,11 @@
 camera:
   type: webcam
-  id: 4
+  id: 5           #/8
   serial: null
   color_width: 1280
   color_height: 720
   fps: 30
-  intrinsics_file: "config/calibration/webcam/intrinsics_test_1.npz"
+  intrinsics_file: "config/calibration/webcam/intrinsics_test_Oct21.npz"
 
 calibration:
   hand_eye_file: "hand_eye.npz"
@@ -15,8 +15,8 @@ calibration:
     target_marker_id: 0
   hand_eye_method: TSAI
   hand_eye_compensation_m:
-    x: 0.01    #0.01
-    y: 0.005
+    x: -0.01    #0.01
+    y: 0.01
     z: 0.00
 detection:
   conf_threshold: 0.50
@@ -35,18 +35,18 @@ robot:
       angle_open: 5.0
       counterclockwise: false
       tau_max: 1.5
-      close_torque: 1.5
-      default_force: 0.30
+      close_torque: 0.5
+      default_force: 0.05
   ready_pose:
     x: 0.3
     y: 0.0
-    z: 0.28
+    z: 0.3
     roll: 0.0
-    pitch: 0.6
+    pitch: 0.7
     duration: 3.0
 
 yolo:
-  model_name: "yoloe-26l-seg.pt"
+  model_name: "best.pt"
   device: "0" #Original cpu
   use_world: true
   custom_classes:
@@ -55,10 +55,11 @@ yolo:
   #  - "glasses"
   #  - "bottle"
     - "blue cube"
+    - "a thin transparent plastic ring on a dark surface"
 grasp_pipeline:
   infer_every_live: 1
   grasp:
-    table_z_m: 0.16
+    table_z_m: 0.15             #0.16 for falcon tube, always +0.05 as the base is 5cm higher than the table
     depth_quantile: 0.5
     pregrasp_offset_m: 0.150
     insertion_depth_m: 0.00

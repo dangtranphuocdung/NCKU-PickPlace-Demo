@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "../../rebotarm_ros2"
+		},
+		{
+			"path": ".."
+		}
+	],
+	"settings": {}
+}

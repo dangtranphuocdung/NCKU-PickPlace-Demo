@@ -16,6 +16,7 @@ Keys:
   G: capture current frame and execute fixed-orientation grasp + waypoint retreat.
   C: macro centering shot over object.
   R: resume live preview.
+  SPACE (during waypoint pause): resume executing remaining retreat waypoints.
   Q/Esc: release, home, and exit.
 
 Usage:
@@ -26,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import select
 import sys
 import time
 from pathlib import Path
@@ -40,13 +42,30 @@ if PROJECT_ROOT_STR not in sys.path:
     sys.path.insert(0, PROJECT_ROOT_STR)
 
 from drivers.camera import make_camera
-from drivers.robot.grasp_driver import GraspDriver, selected_arm_config
-from reBotArm_control_py.actuator import RebotArm
-from reBotArm_control_py.controllers import RebotArmEndPose
-from utils.camera_utils import compose_cam_to_base_transform, load_config, load_hand_eye
+from drivers.robot.grasp_driver import (
+    GraspDriver,
+    ensure_rebot_sdk_in_syspath,
+    selected_arm_config,
+)
+
+ensure_rebot_sdk_in_syspath()
+
+try:
+    from reBotArm_control_py.actuator import RebotArm
+    from reBotArm_control_py.controllers import RebotArmEndPose
+except ImportError:
+    RebotArm = None  # type: ignore
+    RebotArmEndPose = None  # type: ignore
+from utils.camera_utils import (
+    compose_cam_to_base_transform,
+    hand_eye_compensation_matrix,
+    load_config,
+    load_hand_eye,
+)
 from utils.ordinary_grasp import GraspPose, draw_grasp, estimate_grasps, select_best_grasp
 from utils.transforms import (
     canonicalize_parallel_gripper_tcp_rotation,
+    pose6d_to_mat4,
     rotation_matrix_to_euler_zyx,
 )
 from utils.yolo_utils import load_yolo
@@ -60,11 +79,11 @@ from utils.yolo_utils import load_yolo
 #    Set to None to use robot.ready_pose from config/default.yaml,
 #    or customize the dictionary below directly.
 LOCAL_READY_POSE: Optional[dict[str, float]] = {
-    "x": 0.35,
-    "y": 0.00,
-    "z": 0.25,
+    "x": 0.3,
+    "y": 0.0,
+    "z": 0.3,
     "roll": 0.0,
-    "pitch": 0.6,
+    "pitch": 0.7,
     "yaw": 0.0,
     "duration": 3.0,
 }
@@ -83,7 +102,7 @@ FIXED_GRASP_RPY: dict[str, float] = {
 #    - GRIPPER_CLOSE_OFFSET_M: Subtracted from YOLO jaw_width_m when closing (matching main.py).
 #    - GRIPPER_FIXED_CLOSE_M: Set to a float (e.g. 0.015) to close to a fixed width,
 #      or leave as None to use max(0.0, jaw_width_m - GRIPPER_CLOSE_OFFSET_M) like main.py.
-GRIPPER_READY_OPEN_M: float = 0.060
+GRIPPER_READY_OPEN_M: float = 0.055
 GRIPPER_CLOSE_OFFSET_M: float = 0.01
 GRIPPER_FIXED_CLOSE_M: Optional[float] = 0.03
 
@@ -98,14 +117,14 @@ APPROACH_WAYPOINTS: list[dict[str, Any]] = [
 #    Set ENABLE_PREGRASP = False to move directly from Ready Pose to the grasp point.
 ENABLE_PREGRASP: bool = True
 PREGRASP_OFFSET_BASE: dict[str, float] = {
-    "dx": -0.05,   # meters in base X (e.g. -5cm back before approaching)
-    "dy": 0.01,    # meters in base Y
-    "dz": 0.05,    # meters in base Z (e.g. +5cm above object)
-    "duration": 2.0,
+    "dx": 0.00,   # meters in base X (e.g. -5cm back before approaching)
+    "dy": 0.00,    # meters in base Y
+    "dz": 0.03,    # meters in base Z (e.g. +5cm above object)
+    "duration": 5.0,
 }
 
 # Duration (seconds) for the final move into the grasp point (xg, yg, zg)
-GRASP_MOVE_DURATION: float = 3.0
+GRASP_MOVE_DURATION: float = 2.0
 
 # 6. Retreat Waypoints (executed sequentially AFTER the gripper closes on the object)
 #    Each waypoint dictionary supports:
@@ -116,17 +135,38 @@ GRASP_MOVE_DURATION: float = 3.0
 #          "gripper": "open"  -> opens gripper to GRIPPER_READY_OPEN_M
 #          "gripper": "close" -> closes gripper to 0.0m
 #          "gripper": 0.04    -> opens gripper to 0.04m (4.0cm)
+#      - Optional pause trigger to keep arm steady at this pose:
+#          "pause": True      -> holds pose indefinitely; press [SPACE] to resume
+#
+#    How to add a pause:
+#      Option A (within a waypoint dict):
+#          {"x": 0.4, "y": -0.05, "z": 0.15, "roll": 0.7, "pitch": 0.0, "yaw": -0.2, "duration": 2.0, "pause": True}
+#      Option B (as a dedicated entry between waypoints):
+#          pause_waypoint()   # or simply: pause()
+def pause_waypoint(prompt: Optional[str] = None) -> dict[str, Any]:
+    """Helper to insert a pause between waypoints. Arm holds pose until [SPACE] is pressed."""
+    return {"pause": True, "prompt": prompt or "Arm paused. Press [SPACE] to resume motion..."}
+
+
+pause = pause_waypoint  # Alias so both pause() and pause_waypoint() work
+
+
 RETREAT_WAYPOINTS: list[dict[str, Any]] = [
     # WP 1: Lift straight up +10cm in Z from wherever the object was grasped
     {"dx": 0.00, "dy": 0.00, "dz": 0.10, "duration": 2.0},
 
-    {"x": 0.25, "y": -0.15, "z": 0.25, "duration": 1.5},
+    {"x": 0.4, "y": -0.05, "z": 0.25, "duration": 2.0},
+
+    {"x": 0.4, "y": -0.1, "z": 0.2, "roll": 0.75, "pitch": 0.0, "yaw": -0.4, "duration": 3.0},
+    pause("Hold pose until SPACE to continue retreat sequence..."),
+
+    {"x": 0.4, "y": -0.05, "z": 0.25, "roll": 0.7, "pitch": 0.0, "yaw": -0.3, "duration": 2.0},
 
     # WP 3: Lower to placement height and release the object
-    {"x": 0.25, "y": -0.15, "z": 0.20, "duration": 2.0, "gripper": "open"},
+    #{"x": 0.25, "y": -0.15, "z": 0.15, "duration": 1.5, "gripper": "open"},
 
     # WP 4: Lift back up to clear the placed object before returning to Ready Pose
-    {"x": 0.25, "y": -0.15, "z": 0.25, "duration": 2.0},
+    #{"x": 0.25, "y": -0.15, "z": 0.25, "duration": 2.0},
 ]
 
 # ==============================================================================
@@ -177,6 +217,36 @@ def _cam_to_base(T_hand_eye: np.ndarray, grasp_driver: GraspDriver, cfg: dict[st
     return compose_cam_to_base_transform(grasp_driver.get_tcp_pose(), T_hand_eye, cfg)
 
 
+def _compute_camera_centering_tcp_pose(
+    obj_xy: tuple[float, float],
+    table_z_m: float,
+    scan_z: float,
+    scan_rpy: dict[str, float],
+    T_hand_eye: np.ndarray,
+    cfg: dict[str, Any],
+) -> tuple[float, float, float]:
+    """Calculate the exact robot TCP (x, y, z) so that the eye-in-hand camera's
+    optical axis intersects the table plane exactly at obj_xy (image dead-center)."""
+    rot = pose6d_to_mat4(0, 0, 0, scan_rpy["roll"], scan_rpy["pitch"], scan_rpy["yaw"])[:3, :3]
+    T_comp = hand_eye_compensation_matrix(cfg)
+
+    # Camera optical axis unit vector in robot base frame
+    R_cam = rot @ T_hand_eye[:3, :3]
+    dir_b = R_cam[:, 2]
+
+    # Camera position offset relative to TCP in robot base frame
+    p_cam_rel = rot @ T_hand_eye[:3, 3] + T_comp[:3, 3]
+
+    z_cam = scan_z + p_cam_rel[2]
+    if abs(dir_b[2]) < 1e-6:
+        return float(obj_xy[0]), float(obj_xy[1]), float(scan_z)
+    t = (table_z_m - z_cam) / dir_b[2]
+
+    tcp_x = obj_xy[0] - p_cam_rel[0] - t * dir_b[0]
+    tcp_y = obj_xy[1] - p_cam_rel[1] - t * dir_b[1]
+    return float(tcp_x), float(tcp_y), float(scan_z)
+
+
 def _resolve_waypoint_pose(
     wp: dict[str, Any],
     grasp_xyz: tuple[float, float, float],
@@ -217,6 +287,121 @@ def _handle_waypoint_gripper(grasp_driver: GraspDriver, gripper_cmd: Any) -> Non
             grasp_driver.open_gripper(distance_m=0.0)
 
 
+def _is_pure_pause(wp: Any) -> bool:
+    """Check if waypoint is a dedicated pause action rather than a motion waypoint."""
+    if callable(wp):
+        return True
+    if isinstance(wp, dict):
+        has_coords = any(k in wp for k in ("x", "y", "z", "dx", "dy", "dz"))
+        return bool(wp.get("pause", False)) and not has_coords
+    return False
+
+
+def _wait_for_user_resume(
+    prompt: str = "Arm paused. Press [SPACE] to resume motion...",
+    cam: Optional[Any] = None,
+    window_name: Optional[str] = None,
+) -> bool:
+    """Pause execution and hold current robot pose steady until user presses SPACE.
+
+    Listens to both OpenCV camera window (if active) and the terminal keyboard input.
+    Returns True to resume remaining waypoints, or False if aborted (e.g. Q or ESC).
+    """
+    print(f"\n[PAUSE] {prompt}")
+    print("        [SPACE]  -> Resume and execute remaining waypoints")
+    print("        [Q / ESC]-> Abort retreat and return safely to Ready Pose\n")
+
+    old_termios = None
+    is_tty = sys.stdin.isatty()
+    if is_tty:
+        try:
+            import termios
+            import tty
+
+            old_termios = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+        except Exception:
+            old_termios = None
+
+    try:
+        while True:
+            # 1. Update camera preview in OpenCV window if available
+            if cam is not None and window_name is not None:
+                try:
+                    frame, _ = cam.get_frame()
+                    if frame is not None:
+                        display = frame.copy()
+                        h, w = display.shape[:2]
+                        # Top semi-transparent banner
+                        overlay = display.copy()
+                        cv2.rectangle(overlay, (0, 0), (w, 54), (25, 25, 25), -1)
+                        cv2.addWeighted(overlay, 0.75, display, 0.25, 0, display)
+                        cv2.putText(
+                            display,
+                            "[PAUSED] ARM STEADY AT WAYPOINT",
+                            (12, 24),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65,
+                            (0, 215, 255),
+                            2,
+                        )
+                        cv2.putText(
+                            display,
+                            "Press [SPACE] to resume  |  [Q] abort to ready pose",
+                            (12, 46),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.50,
+                            (255, 255, 255),
+                            1,
+                        )
+                        cv2.imshow(window_name, display)
+                except Exception:
+                    pass
+
+            # 2. Check OpenCV window keypress
+            if window_name is not None:
+                try:
+                    key = cv2.waitKey(25) & 0xFF
+                    if key in (32, 10, 13):  # Space, Enter, Return
+                        print("[PAUSE] SPACE received via camera window. Resuming motion...")
+                        return True
+                    if key in (ord("q"), ord("Q"), 27):  # 'q', 'Q', ESC
+                        print("[PAUSE] Abort received via camera window. Returning to Ready Pose...")
+                        return False
+                except Exception:
+                    pass
+
+            # 3. Check terminal keyboard input
+            if is_tty:
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.02)
+                if rlist:
+                    ch = sys.stdin.read(1)
+                    if ch in (" ", "\n", "\r"):
+                        print("[PAUSE] SPACE received via terminal. Resuming motion...")
+                        return True
+                    if ch in ("q", "Q"):
+                        print("[PAUSE] Abort received via terminal. Returning to Ready Pose...")
+                        return False
+                    if ch == "\x1b":
+                        # Differentiate standalone ESC from escape sequence (like arrow keys)
+                        r_esc, _, _ = select.select([sys.stdin], [], [], 0.01)
+                        if r_esc:
+                            sys.stdin.read(2)  # consume rest of arrow key escape sequence
+                        else:
+                            print("[PAUSE] ESC received via terminal. Returning to Ready Pose...")
+                            return False
+            else:
+                time.sleep(0.05)
+    finally:
+        if is_tty and old_termios is not None:
+            try:
+                import termios
+
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_termios)
+            except Exception:
+                pass
+
+
 def _compute_fixed_orientation_grasp(
     position_cam: np.ndarray,
     T_cam2base: np.ndarray,
@@ -228,7 +413,7 @@ def _compute_fixed_orientation_grasp(
 
     xg = float(p_base[0]) + float(insertion_depth_m)
     yg = float(p_base[1])
-    zg = float(p_base[2])
+    zg = float(p_base[2]) #- 0.01
 
     rxg = float(FIXED_GRASP_RPY["roll"])
     ryg = float(FIXED_GRASP_RPY["pitch"])
@@ -251,6 +436,8 @@ def _execute_fixed_path_grasp(
     ready_cfg: dict[str, Any],
     dry_run: bool = False,
     jaw_width_m: float = 0.02,
+    cam: Optional[Any] = None,
+    window_name: Optional[str] = None,
 ) -> bool:
     xg, yg, zg, rxg, ryg, rzg = grasp6d
     xp, yp, zp, rxp, ryp, rzp = pre6d
@@ -258,15 +445,27 @@ def _execute_fixed_path_grasp(
 
     print("\n================ GRASP & WAYPOINT PLAN ================")
     for i, wp in enumerate(APPROACH_WAYPOINTS):
-        wx, wy, wz, wr, wpitch, wyaw, wdur = _resolve_waypoint_pose(wp, grasp_xyz, FIXED_GRASP_RPY)
-        print(f"  [Approach WP #{i+1}] xyz=({wx:+.3f},{wy:+.3f},{wz:+.3f}) rpy=({wr:+.3f},{wpitch:+.3f},{wyaw:+.3f}) dur={wdur:.1f}s")
+        wp_item = wp() if callable(wp) else wp
+        if _is_pure_pause(wp_item):
+            prompt_str = wp_item.get("prompt", "Hold pose until SPACE") if isinstance(wp_item, dict) else "Pause"
+            print(f"  [Approach WP #{i+1}] *** PAUSE: {prompt_str} ***")
+            continue
+        wx, wy, wz, wr, wpitch, wyaw, wdur = _resolve_waypoint_pose(wp_item, grasp_xyz, FIXED_GRASP_RPY)
+        p_tag = " [PAUSE AFTER]" if isinstance(wp_item, dict) and wp_item.get("pause") else ""
+        print(f"  [Approach WP #{i+1}] xyz=({wx:+.3f},{wy:+.3f},{wz:+.3f}) rpy=({wr:+.3f},{wpitch:+.3f},{wyaw:+.3f}) dur={wdur:.1f}s{p_tag}")
     if ENABLE_PREGRASP:
         print(f"  [Pre-Grasp]      xyz=({xp:+.3f},{yp:+.3f},{zp:+.3f}) rpy=({rxp:+.3f},{ryp:+.3f},{rzp:+.3f}) dur={PREGRASP_OFFSET_BASE.get('duration', 2.0):.1f}s")
     print(f"  [Grasp Target]   xyz=({xg:+.3f},{yg:+.3f},{zg:+.3f}) rpy=({rxg:+.3f},{ryg:+.3f},{rzg:+.3f}) dur={GRASP_MOVE_DURATION:.1f}s")
     for i, wp in enumerate(RETREAT_WAYPOINTS):
-        wx, wy, wz, wr, wpitch, wyaw, wdur = _resolve_waypoint_pose(wp, grasp_xyz, FIXED_GRASP_RPY)
-        g_tag = f" gripper={wp['gripper']}" if "gripper" in wp else ""
-        print(f"  [Retreat WP #{i+1}]  xyz=({wx:+.3f},{wy:+.3f},{wz:+.3f}) rpy=({wr:+.3f},{wpitch:+.3f},{wyaw:+.3f}) dur={wdur:.1f}s{g_tag}")
+        wp_item = wp() if callable(wp) else wp
+        if _is_pure_pause(wp_item):
+            prompt_str = wp_item.get("prompt", "Hold pose until SPACE") if isinstance(wp_item, dict) else "Pause"
+            print(f"  [Retreat WP #{i+1}]  *** PAUSE: {prompt_str} ***")
+            continue
+        wx, wy, wz, wr, wpitch, wyaw, wdur = _resolve_waypoint_pose(wp_item, grasp_xyz, FIXED_GRASP_RPY)
+        g_tag = f" gripper={wp_item['gripper']}" if "gripper" in wp_item else ""
+        p_tag = " [PAUSE AFTER]" if isinstance(wp_item, dict) and wp_item.get("pause") else ""
+        print(f"  [Retreat WP #{i+1}]  xyz=({wx:+.3f},{wy:+.3f},{wz:+.3f}) rpy=({wr:+.3f},{wpitch:+.3f},{wyaw:+.3f}) dur={wdur:.1f}s{g_tag}{p_tag}")
     print("=======================================================")
 
     if dry_run:
@@ -275,13 +474,28 @@ def _execute_fixed_path_grasp(
 
     # 1. Optional extra approach waypoints (Ready Pose is already Waypoint 0 with gripper open)
     for i, wp in enumerate(APPROACH_WAYPOINTS):
-        wx, wy, wz, wr, wpitch, wyaw, wdur = _resolve_waypoint_pose(wp, grasp_xyz, FIXED_GRASP_RPY)
+        wp_item = wp() if callable(wp) else wp
+        if _is_pure_pause(wp_item):
+            prompt = wp_item.get("prompt") if isinstance(wp_item, dict) else None
+            msg = prompt or f"Holding pose steady at Approach WP #{i+1}."
+            if not _wait_for_user_resume(msg, cam=cam, window_name=window_name):
+                print(f"[Approach] User aborted at Approach WP #{i+1}")
+                return False
+            continue
+
+        wx, wy, wz, wr, wpitch, wyaw, wdur = _resolve_waypoint_pose(wp_item, grasp_xyz, FIXED_GRASP_RPY)
         print(f"[Approach] Moving to Approach WP #{i+1}: xyz=({wx:+.3f},{wy:+.3f},{wz:+.3f})")
         if not controller.move_to_traj(wx, wy, wz, wr, wpitch, wyaw, duration=wdur):
             print(f"[Approach] Approach WP #{i+1} IK failed")
             return False
         _wait_motion(controller, wdur)
-        _handle_waypoint_gripper(grasp_driver, wp.get("gripper"))
+        _handle_waypoint_gripper(grasp_driver, wp_item.get("gripper"))
+
+        if isinstance(wp_item, dict) and wp_item.get("pause"):
+            prompt = wp_item.get("prompt") or f"Holding pose steady at Approach WP #{i+1}."
+            if not _wait_for_user_resume(prompt, cam=cam, window_name=window_name):
+                print(f"[Approach] User aborted at Approach WP #{i+1}")
+                return False
 
     # 2. Pre-Grasp
     if ENABLE_PREGRASP:
@@ -305,18 +519,36 @@ def _execute_fixed_path_grasp(
     else:
         target_jaw_width = max(0.0, jaw_width_m - GRIPPER_CLOSE_OFFSET_M)
     print(f"[Grasp] Closing gripper to {target_jaw_width * 100:.1f}cm")
-    grasp_driver.open_gripper(distance_m=target_jaw_width)
+    #grasp_driver.open_gripper(distance_m=target_jaw_width)
+    ok = grasp_driver.grasp(force=1.5)  # Clamps with 0.40 N·m torque, stops when touching object
+    print("[Grasp] Object secured" if ok else "[Grasp] Warning: Empty grasp")
 
     # 5. Execute Retreat Waypoints
     print("[Retreat] Starting retreat waypoint sequence...")
     for i, wp in enumerate(RETREAT_WAYPOINTS):
-        wx, wy, wz, wr, wpitch, wyaw, wdur = _resolve_waypoint_pose(wp, grasp_xyz, FIXED_GRASP_RPY)
-        print(f"  -> [Retreat WP #{i+1}/{len(RETREAT_WAYPOINTS)}] xyz=({wx:+.3f},{wy:+.3f},{wz:+.3f}) rpy=({wr:+.2f},{wpitch:+.2f},{wyaw:+.2f}) ({wdur:.1f}s)")
+        wp_item = wp() if callable(wp) else wp
+        if _is_pure_pause(wp_item):
+            prompt = wp_item.get("prompt") if isinstance(wp_item, dict) else None
+            msg = prompt or f"Holding pose steady at Retreat WP #{i+1}."
+            if not _wait_for_user_resume(msg, cam=cam, window_name=window_name):
+                print(f"  [Retreat] User aborted at WP #{i+1}")
+                break
+            continue
+
+        wx, wy, wz, wr, wpitch, wyaw, wdur = _resolve_waypoint_pose(wp_item, grasp_xyz, FIXED_GRASP_RPY)
+        p_str = " [PAUSE]" if isinstance(wp_item, dict) and wp_item.get("pause") else ""
+        print(f"  -> [Retreat WP #{i+1}/{len(RETREAT_WAYPOINTS)}] xyz=({wx:+.3f},{wy:+.3f},{wz:+.3f}) rpy=({wr:+.2f},{wpitch:+.2f},{wyaw:+.2f}) ({wdur:.1f}s){p_str}")
         if not controller.move_to_traj(wx, wy, wz, wr, wpitch, wyaw, duration=wdur):
             print(f"  [Retreat] Warning: IK failed at Retreat WP #{i+1}, stopping retreat early")
             break
         _wait_motion(controller, wdur)
-        _handle_waypoint_gripper(grasp_driver, wp.get("gripper"))
+        _handle_waypoint_gripper(grasp_driver, wp_item.get("gripper"))
+
+        if isinstance(wp_item, dict) and wp_item.get("pause"):
+            prompt = wp_item.get("prompt") or f"Holding pose steady at Retreat WP #{i+1}."
+            if not _wait_for_user_resume(prompt, cam=cam, window_name=window_name):
+                print(f"  [Retreat] User aborted at WP #{i+1}")
+                break
 
     # 6. Return to Ready Pose (Approach Waypoint 0) and open gripper for next cycle
     print("[Grasp] Return to Ready Pose (WP 0)")
@@ -534,20 +766,38 @@ def main() -> int:
                     print("[C] No object found to center on!")
                     continue
 
-                macro_grasp6d, _ = _compute_fixed_orientation_grasp(
-                    best_macro.position, T_cam2base_snap, insertion_depth_m
+                # Extract pure detected object position on table in Base frame (no grasp offsets)
+                p_cam_h = np.array([best_macro.position[0], best_macro.position[1], best_macro.position[2], 1.0], dtype=np.float64)
+                p_base_obj = (np.asarray(T_cam2base_snap, dtype=np.float64) @ p_cam_h)[:3]
+
+                scan_z = float(ready_cfg.get("z", 0.28))
+                scan_rpy = {
+                    "roll": float(ready_cfg.get("roll", 0.0)),
+                    "pitch": float(ready_cfg.get("pitch", 0.6)),
+                    "yaw": float(ready_cfg.get("yaw", 0.0)),
+                }
+                cx, cy, cz = _compute_camera_centering_tcp_pose(
+                    (p_base_obj[0], p_base_obj[1]),
+                    table_z_m,
+                    scan_z,
+                    scan_rpy,
+                    T_hand_eye,
+                    cfg,
                 )
+                print(f"[C] Centering camera directly over object: TCP xyz=({cx:+.3f}, {cy:+.3f}, {cz:+.3f})")
                 if not args.dry_run:
                     controller.move_to_traj(
-                        x=macro_grasp6d[0] - 0.15,
-                        y=macro_grasp6d[1],
-                        z=float(ready_cfg.get("z", 0.25)),
-                        roll=float(ready_cfg.get("roll", 0.0)),
-                        pitch=float(ready_cfg.get("pitch", 0.0)),
-                        yaw=float(ready_cfg.get("yaw", 0.0)),
+                        x=cx,
+                        y=cy,
+                        z=cz,
+                        roll=scan_rpy["roll"],
+                        pitch=scan_rpy["pitch"],
+                        yaw=scan_rpy["yaw"],
                         duration=3.0,
                     )
-                    print("[C] Centering movement started. Please wait 2 seconds, then press G for precision grasp!")
+                    _wait_motion(controller, 3.0)
+                    print("[C] Centering complete! Camera live preview active. Press G to grasp.")
+                frozen = False
                 continue
 
             if key in (ord("g"), ord("G")):
@@ -608,6 +858,8 @@ def main() -> int:
                     ready_cfg,
                     dry_run=args.dry_run,
                     jaw_width_m=best.jaw_width_m,
+                    cam=cam,
+                    window_name=window_name,
                 )
 
     finally:

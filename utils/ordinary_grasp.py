@@ -96,7 +96,7 @@ def draw_grasp(image: np.ndarray, grasp: GraspPose) -> None:
     cv2.putText(image, line1, (x1 + 4, y1 - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
     cv2.putText(image, line2, (x1 + 4, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
-
+# Estimate the 3D grasp pose from a single detection result in camera frame from pixel coordinates and depth map. If no depth is available, use the camera-to-base transform to estimate the depth from the table plane.
 def estimate_grasp(
     result: Any,
     index: int,

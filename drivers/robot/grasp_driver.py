@@ -142,8 +142,8 @@ class GraspDriver:
 
         selected = selected_arm_config(repo_root)
         defaults = {
-            "dm": {"angle_open": 5.0, "counterclockwise": True, "tau_max": 1.5, "close_torque": 1.0, "default_force": 0.30},
-            "rs": {"angle_open": 5.0, "counterclockwise": False, "tau_max": 1.5, "close_torque": 1.0, "default_force": 0.30},
+            "dm": {"angle_open": 5.0, "counterclockwise": True, "tau_max": 1.5, "close_torque": 1.0, "default_force": 0.30, "kd_close": 0.5},
+            "rs": {"angle_open": 5.0, "counterclockwise": False, "tau_max": 1.5, "close_torque": 1.0, "default_force": 0.30, "kd_close": 0.5},
         }[selected.arm_type]
         gcfg = {**defaults, **((gripper_config or {}).get(selected.arm_type) or {})}
         motion_sign = 1.0 if bool(gcfg.get("counterclockwise")) else -1.0
@@ -160,7 +160,9 @@ class GraspDriver:
         self._arrive_tol = 0.12
         self._kp_move = 5.0
         self._kd_move = 1.0
-        self._kd_close = 0.5
+        self._kd_close = abs(float(gcfg.get("kd_close", 0.5)))
+        self._active_close_torque = self._close_torque
+        self._active_kd_close = self._kd_close
         self._stall_vel = 0.05
         self._startup_dist = 0.30
         self._state_lock = threading.Lock()
@@ -305,7 +307,7 @@ class GraspDriver:
                     self._position_reached = True
 
             elif state == self._STATE_CLOSING:
-                command = (0.0, 0.0, 0.0, self._kd_close, self._close_torque)
+                command = (0.0, 0.0, 0.0, self._active_kd_close, self._active_close_torque)
                 if pos_vel_torq is not None:
                     pos, vel, _ = pos_vel_torq
                     self._contact_pos = pos
@@ -338,18 +340,39 @@ class GraspDriver:
 
         self._set_position_target(target)
         self._wait_until(self._position_done, timeout)
+        # Relax motor to IDLE once open: eliminates 500 Hz holding dither/vibration on the wrist
+        with self._state_lock:
+            self._state = self._STATE_IDLE
 
-    def grasp(self, force: Optional[float] = None, timeout: float = 5.0) -> bool:
+    def grasp(
+        self,
+        force: Optional[float] = None,
+        close_torque: Optional[float] = None,
+        kd_close: Optional[float] = None,
+        timeout: float = 5.0,
+    ) -> bool:
         self._ensure_running()
         start_pos, _, _ = self._wait_gripper_state()
         hold_torque = self._close_sign * float(
             np.clip(abs(force if force is not None else self._default_force), 0.05, self._tau_max)
+        )
+        active_close_torque = (
+            self._close_sign * float(np.clip(abs(close_torque), 0.05, self._tau_max))
+            if close_torque is not None
+            else self._close_torque
+        )
+        active_kd_close = (
+            abs(float(kd_close))
+            if kd_close is not None
+            else self._kd_close
         )
         with self._state_lock:
             self._start_pos = start_pos
             self._contact_pos = start_pos
             self._target_pos = 0.0
             self._hold_torque = hold_torque
+            self._active_close_torque = active_close_torque
+            self._active_kd_close = active_kd_close
             self._state = self._STATE_CLOSING
             self._position_reached = False
             self._grasp_result = None
@@ -370,6 +393,8 @@ class GraspDriver:
         self.open_gripper(timeout=min(2.0, timeout))
         self._set_position_target(0.0)
         self._wait_until(self._position_done, timeout)
+        with self._state_lock:
+            self._state = self._STATE_IDLE
 
     def get_tcp_pose(self) -> np.ndarray:
         q_arm = self._arm.get_state(request_feedback=False)[0][: self._n]

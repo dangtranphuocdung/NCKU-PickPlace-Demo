@@ -125,7 +125,7 @@ def main():
     # Save to npz
     calib_dir = Path(args.calib_dir)
     calib_dir.mkdir(parents=True, exist_ok=True)
-    out_file = calib_dir / "intrinsics_test_1.npz"
+    out_file = calib_dir / "intrinsics_test_Oct21.npz"
 
     np.savez(
         str(out_file),

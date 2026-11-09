@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -27,6 +28,40 @@ class YoloDetection:
 
 # Backward-compatible alias for older scripts. New code should use YoloDetection.
 DetectionTarget = YoloDetection
+
+
+class DetectorMemoryError(RuntimeError):
+    """GPU startup allocation failed before robot initialization."""
+
+
+def warmup_yolo(model: Any, frame: np.ndarray, yolo_opts: dict[str, Any]) -> None:
+    """Test the selected device with the same inference settings as grasping."""
+    try:
+        model.predict(frame, verbose=False, device=yolo_opts.get('device', 'cpu'),
+                      conf=float(yolo_opts.get('conf', .25)), iou=float(yolo_opts.get('iou', .45)))
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        memory_failure = any(token in message for token in (
+            'nvml_success', 'cuda out of memory', 'cuda error: out of memory',
+            'nvmapmemalloc', 'allocation on device'))
+        if str(yolo_opts.get('device', 'cpu')).lower() == 'cpu' or not memory_failure:
+            raise
+        raise DetectorMemoryError(
+            'GPU memory allocation failed during detector startup. '
+            'On Jetson, NvMap allocation failure can appear as a PyTorch NVML assertion. '
+            'Close unused memory-heavy applications and retry, or run with --device cpu '
+            'to retain the original model settings with slower inference. '
+            f'No motors were started. Original error: {exc}'
+        ) from exc
+
+
+def configure_jetson_inference() -> None:
+    """Bound cuDNN memory on Jetson without reducing image size or precision."""
+    if Path('/etc/nv_tegra_release').is_file():
+        # Keep the original image size and FP32 precision. Apply before CUDA
+        # initialization; respect explicit settings from the launch environment.
+        os.environ.setdefault('CUDNN_CONV_WSCAP_DBG', '128')
+        os.environ.setdefault('TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT', '64')
 
 
 def resolve_yolo_model_path(model_name: str, project_root: Path) -> Path:
@@ -58,6 +93,7 @@ def load_yolo(
     if no_yolo:
         return None, yolo_opts
 
+    configure_jetson_inference()
     from ultralytics import YOLO
 
     yolo_cfg = cfg.get("yolo", {})

@@ -1,21 +1,30 @@
 camera:
   type: webcam
-  id: 5           #/8
+  id: 2           # DFRobot/UC60 mounted on arm; video4 is the Logitech C920
   serial: null
   color_width: 1280
   color_height: 720
   fps: 30
-  intrinsics_file: "config/calibration/webcam/intrinsics_test_Oct21.npz"
+  fourcc: MJPG
+  buffer_size: 2   # allow capture to continue while MJPEG is decoded
+  autofocus: false  # null preserves camera state; false locks focus
+  focus: 0      # choose with scripts/preview_camera_focus.py; device-specific units
+  intrinsics_file: "config/calibration/webcam/intrinsics_Nov08_Focus_0.npz"
 
 calibration:
-  hand_eye_file: "hand_eye.npz"
+  hand_eye_file: "hand_eye_test_manually_focus0_nov08.npz"  #"hand_eye.npz"
   aruco:
-    marker_length_m: 0.093
-    dict_id: 0
+    marker_length_m: 0.100  # 100 mm between outer black-border edges, excluding white margin
+    dict_id: 20            # cv2.aruco.DICT_APRILTAG_36h11
     target_marker_id: 0
   hand_eye_method: TSAI
+  auto:
+    translation_radius_m: 0.01  # at most 10 mm from first marker-visible TCP pose
+    rotation_deg: 15.0         # varied rotations around multiple axes
+    target_samples: 25
+    max_attempts: 60           # bounds retries if local poses cannot see the marker
   hand_eye_compensation_m:
-    x: -0.01    #0.01
+    x: 0.00    #0.01
     y: 0.01
     z: 0.00
 detection:
@@ -59,7 +68,7 @@ yolo:
 grasp_pipeline:
   infer_every_live: 1
   grasp:
-    table_z_m: 0.15             #0.16 for falcon tube, always +0.05 as the base is 5cm higher than the table
+    table_z_m: 0.17             #0.16 for falcon tube, always +0.05 as the base is 5cm higher than the table
     depth_quantile: 0.5
     pregrasp_offset_m: 0.150
     insertion_depth_m: 0.00

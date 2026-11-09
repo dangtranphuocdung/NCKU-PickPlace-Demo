@@ -32,6 +32,7 @@ from drivers.camera import make_camera
 from utils.camera_utils import load_config
 from utils.ordinary_grasp import draw_grasp, estimate_grasps, get_depth_mm, select_best_grasp
 from utils.transforms import canonicalize_parallel_gripper_tcp_rotation, rotation_matrix_to_euler_zyx
+from utils.yolo_utils import configure_jetson_inference
 
 
 clicked_point = {"u": -1, "v": -1}
@@ -57,6 +58,7 @@ def print_best_grasp(grasp) -> None:
 
 
 def main():
+    configure_jetson_inference()
     parser = argparse.ArgumentParser(description="Ordinary Grasp Test")
     parser.add_argument("--config", default="config/default.yaml", help="Path to config file")
     args = parser.parse_args()

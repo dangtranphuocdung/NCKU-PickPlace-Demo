@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype")
 
 from drivers.camera import make_camera
-from drivers.robot.grasp_driver import GraspDriver, selected_arm_config
+from drivers.robot.grasp_driver import GraspDriver, resolve_dm_serial_channel, selected_arm_config
 from reBotArm_control_py.actuator import RebotArm
 from reBotArm_control_py.controllers import RebotArmEndPose
 from calibration.hand_eye import CalibMode, HandEyeCalibrator
@@ -179,29 +179,54 @@ class GravityCompController:
 
     def start(self) -> None:
         """Connect, enable, set MIT mode, and start gravity compensation."""
-        self._arm.connect()
-        print("[GravityComp] Connected")
+        resolve_dm_serial_channel(self._arm)
+        try:
+            self._arm.connect()
+            print("[GravityComp] Connected")
+            n = self._arm.arm.num_joints
+            self._n = n
+            for name, group, gains in (
+                ('arm', self._arm.arm, {'kp': np.full(n, self.KP), 'kd': np.full(n, self.KD)}),
+                ('gripper', self._arm.gripper, {}),
+            ):
+                for attempt in range(3):
+                    if group.mode_mit(**gains):
+                        break
+                    if attempt == 2:
+                        raise RuntimeError(f'[GravityComp] {name} MIT mode was not acknowledged; motors were not enabled')
+                    print(f'[GravityComp] Retrying {name} MIT mode ({attempt + 1}/2)')
+                    time.sleep(0.1)
+            self._arm.enable_all()
+            print("[GravityComp] Enabled")
+            self._wait_state_valid()
+            with self._io_lock:
+                q0 = self._arm.get_state()[0][:n]
+            self._q_target = q0.copy()
+            self._integral = np.zeros(n)
 
-        self._arm.arm.mode_mit(
-            kp=np.full(self._arm.arm.num_joints, self.KP),
-            kd=np.full(self._arm.arm.num_joints, self.KD),
-        )
-        self._arm.gripper.mode_mit()
-        self._arm.enable_all()
-        print("[GravityComp] Enabled")
-
-        n = self._arm.arm.num_joints
-        self._n = n
-        self._wait_state_valid()
-        with self._io_lock:
-            q0 = self._arm.get_state()[0][:n]
-        self._q_target = q0.copy()
-        self._integral = np.zeros(n)
-
-        print(f"[GravityComp] MIT mode, kp={self.KP} kd={self.KD}. Move the arm by hand.")
-
-        self._gc_running.set()
-        self._arm.start_control_loop(self._worker, rate=self._arm.rate)
+            print(f"[GravityComp] MIT mode, kp={self.KP} kd={self.KD}. Move the arm by hand.")
+            self._gc_running.set()
+            self._arm.start_control_loop(self._worker, rate=self._arm.rate)
+        except BaseException:
+            self._gc_running.clear()
+            # Disconnect without homing; startup may not have valid feedback.
+            # Explicitly release native handles, including a partial connect.
+            motors = list(self._arm._motor_map.values())
+            controllers = list(self._arm._ctrl_map.values())
+            try:
+                self._arm.disconnect()
+            except Exception as exc:
+                print(f'[GravityComp] Startup cleanup failed: {exc}')
+            finally:
+                for handle in motors + controllers:
+                    try:
+                        handle.close()
+                    except Exception as exc:
+                        print(f'[GravityComp] Handle cleanup failed: {exc}')
+                self._arm._motor_map.clear()
+                self._arm._ctrl_map.clear()
+                self._arm._connected = False
+            raise
 
     def _wait_state_valid(self, timeout: float = 2.0) -> None:
         """Wait until all motor feedback is available."""
@@ -209,10 +234,10 @@ class GravityCompController:
         while time.monotonic() < t_end:
             with self._io_lock:
                 self._arm.get_state()
-                ok = all(
-                    m.get_state() is not None
-                    for m in self._arm._motor_map.values()
-                )
+                states = [m.get_state() for m in self._arm._motor_map.values()]
+                ok = len(states) == len(self._arm._all_joints) and bool(states) and all(
+                    s is not None and np.all(np.isfinite([s.pos, s.vel, s.torq]))
+                    for s in states)
             if ok:
                 return
             time.sleep(0.02)
@@ -310,7 +335,10 @@ def main():
     he_method  = cfg["calibration"].get("hand_eye_method", "TSAI")
     save_path  = calib_dir / "hand_eye_test_manually.npz"
 
-    # Camera.
+    # Camera: make_camera applies the fixed focus from default.yaml.
+    if cam_type == "webcam" and (cfg["camera"].get("focus") is None
+                                or cfg["camera"].get("autofocus") is True):
+        parser.error("Set camera.focus and camera.autofocus: false in config/default.yaml")
     cam = make_camera(cfg)
     cam.setup_aruco(
         marker_length_m=aruco_cfg["marker_length_m"],

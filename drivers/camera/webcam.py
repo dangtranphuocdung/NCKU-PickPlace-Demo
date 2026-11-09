@@ -11,6 +11,7 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+from utils.webcam_capture import capture_metadata, open_webcam
 
 from .base import CameraDriver, CameraFrameError
 
@@ -24,6 +25,10 @@ class WebcamDriver(CameraDriver):
         fps: int = 30,
         calib_dir: str = "",
         calib_file: Optional[str] = None,
+        focus: Optional[int] = None,
+        autofocus: Optional[bool] = None,
+        fourcc: str = 'MJPG',
+        buffer_size: int = 2,
     ) -> None:
         super().__init__()
         self.camera_id = int(camera_id) if str(camera_id).isdigit() else camera_id
@@ -32,10 +37,16 @@ class WebcamDriver(CameraDriver):
         self.fps = fps
         self.calib_dir = Path(calib_dir)
         self.calib_file = Path(calib_file) if calib_file else None
+        self.focus = focus
+        self.autofocus = autofocus
+        self.fourcc = fourcc
+        self.buffer_size = buffer_size
 
         self._cap: Optional[cv2.VideoCapture] = None
         self._K: Optional[np.ndarray] = None
         self._D: Optional[np.ndarray] = None
+        self._calib_focus = None
+        self._calib_size = None
 
         self._load_calibration()
 
@@ -46,6 +57,11 @@ class WebcamDriver(CameraDriver):
                 data = np.load(str(calib_file), allow_pickle=False)
                 self._K = data["camera_matrix"].astype(np.float64)
                 self._D = data["distortion_coefficients"].astype(np.float64)
+                if 'focus_absolute' in data:
+                    self._calib_focus = float(np.asarray(data['focus_absolute']).reshape(-1)[0])
+                if 'image_width' in data and 'image_height' in data:
+                    self._calib_size = (int(np.asarray(data['image_width']).reshape(-1)[0]),
+                                        int(np.asarray(data['image_height']).reshape(-1)[0]))
                 print(f"[Webcam] Loaded calibration from {calib_file}")
             except Exception as e:
                 print(f"[Webcam] Failed to load calibration: {e}")
@@ -64,14 +80,24 @@ class WebcamDriver(CameraDriver):
     def open(self) -> None:
         if self._cap is not None:
             return
+        if self._calib_size is not None and self._calib_size != (self.width, self.height):
+            raise CameraFrameError(f'Calibration resolution {self._calib_size} does not match capture')
         self._reset_frame_failures()
-        self._cap = cv2.VideoCapture(self.camera_id)
-        if not self._cap.isOpened():
-            raise CameraFrameError(f"Failed to open webcam {self.camera_id}")
-
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self._cap.set(cv2.CAP_PROP_FPS, self.fps)
+        self._cap = open_webcam(
+            self.camera_id, self.width, self.height, self.fps,
+            fourcc=self.fourcc, buffer_size=self.buffer_size,
+            focus=self.focus, autofocus=self.autofocus,
+        )
+        try:
+            meta = self.capture_metadata
+            if self._calib_focus is not None:
+                if meta['autofocus'] or abs(meta['focus_absolute'] - self._calib_focus) > .5:
+                    raise CameraFrameError(f'Calibration requires fixed focus={self._calib_focus}; capture is {meta}')
+            else:
+                print('[Webcam] Calibration has no focus metadata; its lens setting cannot be verified.')
+        except BaseException:
+            self.close()
+            raise
         
         # Give the camera a moment to initialize
         for _ in range(5):
@@ -111,5 +137,11 @@ class WebcamDriver(CameraDriver):
 
     @property
     def D(self) -> np.ndarray:
-        return self._D
+        # get_frame() already undistorts with K unchanged. Pose estimation must
+        # use zero distortion with those rectified image coordinates.
+        return np.zeros_like(self._D)
+
+    @property
+    def capture_metadata(self) -> dict:
+        return capture_metadata(self._cap, self.camera_id) if self._cap is not None else {}
 

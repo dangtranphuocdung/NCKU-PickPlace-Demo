@@ -13,6 +13,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -20,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 def main():
     # Argument parsing
     parser = argparse.ArgumentParser()
-    parser.add_argument("--camera-id", default=0, help="Camera device ID or path")
+    parser.add_argument("--camera-id", default=2, help="Camera device ID or path")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--rows", type=int, default=6, help="Number of inner corners per a column")
@@ -28,6 +29,12 @@ def main():
     parser.add_argument("--square-size", type=float, default=0.023, help="Size of a square in meters")
     parser.add_argument("--calib-dir", default=str(PROJECT_ROOT / "config" / "calibration" / "webcam"))
     args = parser.parse_args()
+    with (PROJECT_ROOT / "config/default.yaml").open(encoding="utf-8") as f:
+        camera_cfg = yaml.safe_load(f)["camera"]
+    focus = camera_cfg.get("focus")
+    if focus is None or camera_cfg.get("autofocus") is True:
+        print("Set camera.focus and camera.autofocus: false in config/default.yaml.")
+        return
 
     # Initialize camera
     cap = cv2.VideoCapture(int(args.camera_id) if str(args.camera_id).isdigit() else args.camera_id)
@@ -36,6 +43,15 @@ def main():
 
     if not cap.isOpened():
         print(f"Error: Could not open camera {args.camera_id}")
+        return
+
+    # Apply fixed focus from YAML; zero is a valid lens setting.
+    if (not cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+            or not cap.set(cv2.CAP_PROP_FOCUS, float(focus))
+            or cap.get(cv2.CAP_PROP_AUTOFOCUS) != 0
+            or abs(cap.get(cv2.CAP_PROP_FOCUS) - float(focus)) > 0.5):
+        print(f"Error: Camera did not accept fixed focus={focus}.")
+        cap.release()
         return
 
     checkerboard_size = (args.cols, args.rows)
@@ -125,7 +141,7 @@ def main():
     # Save to npz
     calib_dir = Path(args.calib_dir)
     calib_dir.mkdir(parents=True, exist_ok=True)
-    out_file = calib_dir / "intrinsics_test_Oct21.npz"
+    out_file = calib_dir / "intrinsics_Nov08_Focus_0.npz"
 
     np.savez(
         str(out_file),

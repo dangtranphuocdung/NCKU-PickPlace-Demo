@@ -68,7 +68,7 @@ from utils.transforms import (
     pose6d_to_mat4,
     rotation_matrix_to_euler_zyx,
 )
-from utils.yolo_utils import load_yolo
+from utils.yolo_utils import DetectorMemoryError, load_yolo, warmup_yolo
 
 
 # ==============================================================================
@@ -119,7 +119,7 @@ ENABLE_PREGRASP: bool = True
 PREGRASP_OFFSET_BASE: dict[str, float] = {
     "dx": 0.00,   # meters in base X (e.g. -5cm back before approaching)
     "dy": 0.00,    # meters in base Y
-    "dz": 0.03,    # meters in base Z (e.g. +5cm above object)
+    "dz": 0.1,    # meters in base Z (e.g. +5cm above object)
     "duration": 5.0,
 }
 
@@ -155,12 +155,11 @@ RETREAT_WAYPOINTS: list[dict[str, Any]] = [
     # WP 1: Lift straight up +10cm in Z from wherever the object was grasped
     {"dx": 0.00, "dy": 0.00, "dz": 0.10, "duration": 2.0},
 
-    {"x": 0.4, "y": -0.05, "z": 0.25, "duration": 2.0},
 
-    {"x": 0.4, "y": -0.1, "z": 0.2, "roll": 0.75, "pitch": 0.0, "yaw": -0.4, "duration": 3.0},
-    pause("Hold pose until SPACE to continue retreat sequence..."),
+    {"x": 0.35, "y": 0.30, "z": 0.18, "roll": -0.8, "pitch": 0.0, "yaw": 1.2, "duration": 3.0},
+    #pause("Hold pose until SPACE to continue retreat sequence..."),
 
-    {"x": 0.4, "y": -0.05, "z": 0.25, "roll": 0.7, "pitch": 0.0, "yaw": -0.3, "duration": 2.0},
+    #{"x": 0.4, "y": -0.05, "z": 0.25, "roll": 0.7, "pitch": 0.0, "yaw": -0.3, "duration": 2.0},
 
     # WP 3: Lower to placement height and release the object
     #{"x": 0.25, "y": -0.15, "z": 0.15, "duration": 1.5, "gripper": "open"},
@@ -601,6 +600,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fixed-orientation grasp with customizable retreat waypoints")
     parser.add_argument("--config", default="config/default.yaml")
     parser.add_argument("--dry-run", action="store_true", help="estimate only; do not move the arm")
+    parser.add_argument('--device', default=None, help='Override YOLO device, e.g. 0 or cpu')
     return parser.parse_args()
 
 
@@ -664,7 +664,19 @@ def main() -> int:
         infer_every = max(1, int(gp_cfg.get("infer_every_live", 2)))
 
         print(f"=== Load YOLO: {model_name} ===")
-        model, yolo_opts = load_yolo(cfg, project_root=PROJECT_ROOT)
+        model, yolo_opts = load_yolo(cfg, project_root=PROJECT_ROOT, device_override=args.device)
+
+        # Check full-resolution inference before enabling motors or moving to
+        # ready; Jetson CUDA allocation errors must not occur first after motion.
+        warmup_frame, _ = cam.get_frame()
+        if warmup_frame is None:
+            raise RuntimeError("Detector startup check failed: no camera frame; robot was not started")
+        try:
+            warmup_yolo(model, warmup_frame, yolo_opts)
+        except DetectorMemoryError as exc:
+            print(f'[Detector] {exc}')
+            return 1
+        del warmup_frame
 
         print("=== Init robot ===")
         selected = selected_arm_config(robot_cfg.get("repo_root"))
@@ -676,7 +688,11 @@ def main() -> int:
             gripper_config=robot_cfg.get("gripper"),
             repo_root=robot_cfg.get("repo_root"),
         )
-        grasp_driver.start()
+        try:
+            grasp_driver.start()
+        except RuntimeError as exc:
+            print(f"[Robot] {exc}")
+            return 1
         robot_ready = True
         print(f"[Robot] mode: {selected.controller_mode}")
 
@@ -863,7 +879,7 @@ def main() -> int:
                 )
 
     finally:
-        print("\n[Exit] Release gripper and home")
+        print("\n[Exit] " + ("Release gripper and home" if robot_ready else "Close connections"))
         try:
             if robot_ready and grasp_driver is not None and controller is not None and getattr(controller, "_running", False):
                 grasp_driver.release_gripper()

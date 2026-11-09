@@ -31,7 +31,10 @@ def make_camera(cfg: dict) -> CameraDriver:
         return RealsenseCamera(w, h, fps, calib_dir=calib_dir)
     elif "webcam" in cam_type:
         camera_id = cam_cfg.get("id", 0)
-        return WebcamDriver(camera_id, w, h, fps, calib_dir=calib_dir, calib_file=calib_file)
+        return WebcamDriver(camera_id, w, h, fps, calib_dir=calib_dir, calib_file=calib_file,
+                            focus=cam_cfg.get('focus'), autofocus=cam_cfg.get('autofocus'),
+                            fourcc=cam_cfg.get('fourcc', 'MJPG'),
+                            buffer_size=cam_cfg.get('buffer_size', 2))
     else:
         raise ValueError(
             f"Unsupported camera type: {cam_type!r}\n"

@@ -27,6 +27,7 @@ if PROJECT_ROOT_STR not in sys.path:
 from drivers.camera import make_camera
 from utils.camera_utils import load_config
 from utils.ordinary_grasp import get_depth_mm
+from utils.yolo_utils import configure_jetson_inference
 
 # ==========================================
 # Mouse state
@@ -44,6 +45,7 @@ def mouse_callback(event, x, y, flags, param):
 # Main
 # ==========================================
 def main():
+    configure_jetson_inference()
     config_path  = PROJECT_ROOT / "config" / "default.yaml"
     models_dir   = PROJECT_ROOT / "models"
     models_dir.mkdir(parents=True, exist_ok=True)

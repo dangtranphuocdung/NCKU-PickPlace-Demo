@@ -7,10 +7,16 @@ appear perfectly straight in the camera view.
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+from utils.webcam_capture import add_capture_arguments, capture_options, open_webcam
+from utils.camera_utils import load_config
 
 
 def draw_grid(img: np.ndarray, grid_size: int = 80) -> None:
@@ -26,14 +32,15 @@ def draw_grid(img: np.ndarray, grid_size: int = 80) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Visually verify camera calibration")
-    parser.add_argument("--file", default="config/calibration/webcam/intrinsics_test_1.npz", 
+    parser.add_argument("--file", default=None,
                         help="Path to the intrinsics.npz file")
-    parser.add_argument("--camera-id", default=4, help="Camera device ID or path")
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=720)
+    add_capture_arguments(parser)
     args = parser.parse_args()
+    opts = capture_options(args)
 
-    calib_file = Path(args.file).resolve()
+    cfg = load_config(args.config)
+    calib_file = Path(args.file) if args.file else PROJECT_ROOT / cfg['camera']['intrinsics_file']
+    calib_file = calib_file.resolve()
     if not calib_file.exists():
         print(f"Error: Calibration file not found at {calib_file}")
         return
@@ -49,9 +56,7 @@ def main():
         return
 
     # Open the camera
-    cap = cv2.VideoCapture(int(args.camera_id) if str(args.camera_id).isdigit() else args.camera_id)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    cap = open_webcam(**opts)
 
     if not cap.isOpened():
         print(f"Error: Could not open camera {args.camera_id}")
@@ -86,8 +91,8 @@ def main():
 
             if side_by_side:
                 # Stack the original and undistorted side-by-side
-                half_orig = cv2.resize(frame, (args.width // 2, args.height // 2))
-                half_undist = cv2.resize(undistorted, (args.width // 2, args.height // 2))
+                half_orig = cv2.resize(frame, (opts['width'] // 2, opts['height'] // 2))
+                half_undist = cv2.resize(undistorted, (opts['width'] // 2, opts['height'] // 2))
                 cv2.putText(half_orig, "Original (Distorted)", (10, 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 cv2.putText(half_undist, "Calibrated (Undistorted)", (10, 30), 

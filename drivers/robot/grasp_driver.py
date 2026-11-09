@@ -105,6 +105,68 @@ def selected_arm_config(repo_root: Optional[str] = None) -> SelectedArmConfig:
     raise ValueError(f"Cannot infer arm type from hardware config: {hw_path}")
 
 
+def resolve_dm_serial_channel(arm: Any) -> str:
+    """Find the serial bridge using register reads only; never enable motors.
+
+    USB enumeration can put a different device at the configured ttyACM index.
+    Require replies from every configured motor before accepting an adapter.
+    """
+    channel = arm._channel
+    joints = arm._all_joints
+    if not channel.startswith("/dev/tty") or not all(j.vendor == "damiao" for j in joints):
+        return channel
+    from motorbridge import Controller
+
+    candidates = [channel]
+    for pattern in ("ttyACM*", "ttyUSB*"):
+        for port in sorted(Path("/dev").glob(pattern)):
+            if str(port) not in candidates:
+                candidates.append(str(port))
+    failures = []
+    for port in candidates:
+        ctrl = None
+        motors = []
+        try:
+            print(f"[Robot] Checking Damiao register replies on {port} (no motion)")
+            ctrl = Controller.from_dm_serial(port, 921600)
+            for joint in joints:
+                motor = ctrl.add_damiao_motor(joint.motor_id, joint.feedback_id, joint.model)
+                motors.append(motor)
+                # Register 10 is the control mode. Read it without changing it.
+                try:
+                    mode = motor.get_register_u32(10, 300)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"{joint.name}: CAN ID=0x{joint.motor_id:02X}, "
+                        f"feedback ID=0x{joint.feedback_id:02X}: {exc}"
+                    ) from exc
+                print(f"[Robot] {joint.name}: CAN ID=0x{joint.motor_id:02X}, "
+                      f"feedback ID=0x{joint.feedback_id:02X}, mode={mode}: replied")
+            print(f"[Robot] Verified {len(joints)} motors on {port}")
+            arm._channel = port
+            return port
+        except Exception as exc:
+            failures.append(f"{port}: {exc}")
+        finally:
+            if ctrl is not None:
+                # Native motor handles retain shared ownership of the controller.
+                # Freeing only the controller wrapper can leave the serial FD
+                # (and its exclusive lock) alive when the SDK reopens the port.
+                try:
+                    ctrl.close_bus()
+                finally:
+                    try:
+                        for motor in motors:
+                            motor.close()
+                    finally:
+                        ctrl.close()
+    raise RuntimeError(
+        "No Damiao serial bridge replied for all configured motors. "
+        "No motors were enabled. " + "; ".join(failures)
+        + ". Check motor power, CAN wiring, adapter protocol and motor IDs."
+    )
+
+
 class GraspDriver:
     MAX_DISTANCE_M = GRIPPER_MAX_DISTANCE_M
     _STATE_IDLE = "idle"
@@ -181,24 +243,89 @@ class GraspDriver:
             return
 
         self._controller._has_gripper = False
-        self._arm.connect()
-        self._gripper_motor = self._gripper_group._mm[self._gripper_name]
-        if self._arm_group:
+        resolve_dm_serial_channel(self._arm)
+        try:
+            self._arm.connect()
+            self._gripper_motor = self._gripper_group._mm[self._gripper_name]
             if self._controller._arm_control_mode == "mit":
-                self._arm_group.mode_mit(
-                    kp=self._arm_group._mit_kp,
-                    kd=self._arm_group._mit_kd,
+                self._set_startup_mode(
+                    "arm MIT", self._arm_group.mode_mit,
+                    kp=self._arm_group._mit_kp, kd=self._arm_group._mit_kd,
                 )
             else:
-                self._arm_group.mode_pos_vel()
-            self._arm_group.enable()
+                self._set_startup_mode("arm position/velocity", self._arm_group.mode_pos_vel)
+            self._set_startup_mode("gripper MIT", self._gripper_group.mode_mit)
 
-        self._gripper_group.mode_mit()
-        self._gripper_group.enable()
-        self._prime_arm_target()
-        self._prime_gripper_state()
-        self._arm.start_control_loop(self._loop_cb)
-        self._controller._running = True
+            # Do not enable either group unless both mode changes succeeded.
+            self._arm_group.enable()
+            self._gripper_group.enable()
+            self._wait_startup_feedback()
+            self._prime_arm_target()
+            self._prime_gripper_state()
+            self._arm.start_control_loop(self._loop_cb)
+            self._controller._running = True
+        except BaseException:
+            # Also covers interruption and failures after enabling. Never call
+            # controller.end(): its homing trajectory needs a valid startup.
+            self._controller._running = False
+            self._gripper_motor = None
+            # The SDK clears its maps without closing native motor handles.
+            # Keep references so a failed startup cannot leave the USB port
+            # locked, including failures partway through connect().
+            motors = list(self._arm._motor_map.values())
+            controllers = list(self._arm._ctrl_map.values())
+            try:
+                self._arm.disconnect()
+            except Exception as cleanup_error:
+                print(f"[Robot] Startup cleanup failed: {cleanup_error}")
+            finally:
+                for handle in motors + controllers:
+                    try:
+                        handle.close()
+                    except Exception as cleanup_error:
+                        print(f"[Robot] Handle cleanup failed: {cleanup_error}")
+                self._arm._motor_map.clear()
+                self._arm._ctrl_map.clear()
+                self._arm._connected = False
+            raise
+
+    def _set_startup_mode(self, name: str, set_mode: Any, **kwargs: Any) -> None:
+        # SDK mode methods return False on a wait-ACK timeout. Retry only the
+        # idempotent mode setup on this verified bridge, before enabling motors.
+        for attempt in range(3):
+            if set_mode(**kwargs):
+                return
+            if attempt < 2:
+                print(f"[Robot] {name} mode not acknowledged; retry {attempt + 1}/2")
+                time.sleep(0.1)
+        raise self._startup_error(f"{name} control mode was not acknowledged after 3 attempts")
+
+    def _startup_error(self, reason: str) -> RuntimeError:
+        return RuntimeError(
+            f"Robot initialization failed: {reason}. No trajectory was started. "
+            f"Hardware config: {self._arm.hardware_yaml}. "
+            "Check motor power, USB/CAN connection, configured channel, motor/feedback IDs, "
+            "and that no other process is using the adapter."
+        )
+
+    def _wait_startup_feedback(self, timeout: float = 2.0) -> None:
+        # SDK get_state() substitutes zeros for missing motors; those zeros must
+        # never become the starting point of a Cartesian trajectory.
+        deadline = time.monotonic() + timeout
+        missing = []
+        while True:
+            missing = []
+            for group in (self._arm_group, self._gripper_group):
+                group._request_feedback()
+                for jc in group._jcfgs:
+                    state = group._mm[jc.name].get_state()
+                    if state is None or not np.all(np.isfinite([state.pos, state.vel, state.torq])):
+                        missing.append(jc.name)
+            if not missing:
+                return
+            if time.monotonic() >= deadline:
+                raise self._startup_error("missing or invalid feedback: " + ", ".join(missing))
+            time.sleep(0.02)
 
     def _loop_cb(self, r: Any, dt: float) -> None:
         self._controller._loop_cb(r, dt)

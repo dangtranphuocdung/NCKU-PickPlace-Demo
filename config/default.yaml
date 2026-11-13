@@ -1,6 +1,6 @@
 camera:
   type: webcam
-  id: 5           #/8
+  id: 4           #/8
   serial: null
   color_width: 1280
   color_height: 720
@@ -46,7 +46,7 @@ robot:
     duration: 3.0
 
 yolo:
-  model_name: "best.pt"
+  model_name: "best_with_green_rack.pt"
   device: "0" #Original cpu
   use_world: true
   custom_classes:

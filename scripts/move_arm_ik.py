@@ -3,16 +3,21 @@
 move_arm_ik.py — Simple Robot Arm IK Trajectory Mover.
 
 Moves the arm using Cartesian coordinates: x, y, z, roll, pitch, yaw.
+Supports keyboard gripper control: 'o' to open, 'c' to close using force control.
 
 Usage:
     # 1. Single motion via CLI arguments:
     python scripts/move_arm_ik.py 0.30 0.00 0.30 0.00 0.70 0.00
     python scripts/move_arm_ik.py --x 0.30 --y 0.00 --z 0.30 --roll 0.00 --pitch 0.70 --yaw 0.00
 
-    # 2. Interactive prompt (enter poses repeatedly to take dataset photos):
+    # 2. Interactive prompt (enter poses, 'o' to open gripper, 'c' to close with force control):
     python scripts/move_arm_ik.py
 
-    # 3. Dry-run simulation (without hardware):
+    # 3. Direct gripper control:
+    python scripts/move_arm_ik.py --open
+    python scripts/move_arm_ik.py --close
+
+    # 4. Dry-run simulation (without hardware):
     python scripts/move_arm_ik.py 0.30 0.00 0.30 0.00 0.70 0.00 --dry-run
 """
 
@@ -29,6 +34,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.camera_utils import load_config
+
+# Gripper settings matching fixed_path_grasp.py
+GRIPPER_READY_OPEN_M: float = 0.055  # 5.5cm open width
+GRIPPER_FORCE: float = 1.5           # Force control holding torque (N·m)
 
 try:
     from drivers.robot.grasp_driver import (
@@ -56,6 +65,42 @@ def wait_motion(controller: Any, duration: float, extra: float = 0.4) -> None:
         thread.join(timeout=duration + extra + 2.0)
     else:
         time.sleep(duration + extra)
+
+
+def open_gripper(
+    grasp_driver: Any,
+    distance_m: float = GRIPPER_READY_OPEN_M,
+    dry_run: bool = False,
+) -> None:
+    """Open gripper to target distance (matching fixed_path_grasp.py)."""
+    print(f"\n[Gripper] Opening to {distance_m * 100:.1f}cm...")
+    if dry_run or grasp_driver is None:
+        print("[Dry-run] Gripper opened.")
+        return
+    try:
+        grasp_driver.open_gripper(distance_m=distance_m)
+        print("[Gripper] Opened.")
+    except Exception as exc:
+        print(f"[Gripper] Error opening gripper: {exc}")
+
+
+def close_gripper(
+    grasp_driver: Any,
+    force: float = GRIPPER_FORCE,
+    dry_run: bool = False,
+) -> bool:
+    """Close gripper slowly using force control (matching fixed_path_grasp.py)."""
+    print(f"\n[Gripper] Closing slowly using force control (force={force:.2f})...")
+    if dry_run or grasp_driver is None:
+        print("[Dry-run] Gripper closed with force control (simulated).")
+        return True
+    try:
+        ok = grasp_driver.grasp(force=force)
+        print("[Gripper] Object secured (force hold active)." if ok else "[Gripper] Fully closed (no object contact detected).")
+        return ok
+    except Exception as exc:
+        print(f"[Gripper] Error closing gripper: {exc}")
+        return False
 
 
 def move_arm(
@@ -120,6 +165,8 @@ def main() -> int:
     parser.add_argument("--pitch", type=float, default=None, help="Target Pitch in radians")
     parser.add_argument("--yaw", type=float, default=None, help="Target Yaw in radians")
     parser.add_argument("--duration", type=float, default=2.0, help="Trajectory duration in seconds (default: 2.0)")
+    parser.add_argument("--open", action="store_true", help="Open gripper")
+    parser.add_argument("--close", action="store_true", help="Close gripper slowly using force control")
     parser.add_argument("--no-hold", action="store_true", help="Do not pause/hold at target pose on exit")
     parser.add_argument("--dry-run", action="store_true", help="Simulate motion without hardware connection")
     parser.add_argument("--config", default="config/default.yaml", help="Path to default.yaml")
@@ -165,26 +212,53 @@ def main() -> int:
                 args.yaw if args.yaw is not None else float(ready_cfg.get("yaw", 0.00)),
             ]
 
+        # Standalone gripper command via CLI (e.g. python scripts/move_arm_ik.py --open)
+        if target_pose is None and (args.open or args.close):
+            if args.open:
+                open_gripper(grasp_driver, dry_run=args.dry_run)
+            if args.close:
+                close_gripper(grasp_driver, dry_run=args.dry_run)
+            return 0
+
         # Case 1: Pose passed via CLI -> move once
         if target_pose is not None:
             x, y, z, roll, pitch, yaw = target_pose
             success = move_arm(controller, x, y, z, roll, pitch, yaw, duration=args.duration, dry_run=args.dry_run)
             if success and not args.dry_run and not args.no_hold:
-                try:
-                    input("\n[Hold] Arm reached target pose. Take your photos, then press Enter to exit/home (or Ctrl+C)... ")
-                except (EOFError, KeyboardInterrupt):
-                    pass
+                if args.open:
+                    open_gripper(grasp_driver, dry_run=args.dry_run)
+                elif args.close:
+                    close_gripper(grasp_driver, dry_run=args.dry_run)
+                print("\n[Hold] Arm reached target pose. Take your photos.")
+                print("       Keys: [o] open gripper, [c] close gripper (force control), [Enter/q] exit")
+                while True:
+                    try:
+                        cmd = input("[Hold: o=open, c=close, Enter=exit] > ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        break
+                    if not cmd or cmd in ("q", "quit", "exit"):
+                        break
+                    if cmd in ("o", "open"):
+                        open_gripper(grasp_driver, dry_run=args.dry_run)
+                    elif cmd in ("c", "close"):
+                        close_gripper(grasp_driver, dry_run=args.dry_run)
+                    else:
+                        print("Unknown command. Enter 'o' to open, 'c' to close, or press Enter to exit.")
             return 0
 
         # Case 2: No pose on CLI -> interactive prompt for taking dataset photos
         print("\n=== Robot Arm IK Mover ===")
-        print("Enter: x y z roll pitch yaw (or 'q' to quit)")
+        print("Commands:")
+        print("  x y z roll pitch yaw : Move arm end-effector via IK")
+        print("  o / O                : Open gripper")
+        print("  c / C                : Close gripper slowly using force control")
+        print("  q / quit             : Exit")
         print(f"Example Ready Pose: 0.30 0.00 0.30 0.00 0.70 0.00")
         print("=" * 45)
 
         while True:
             try:
-                line = input("\nPose [x y z r p y] > ").strip()
+                line = input("\nPose or Command [x y z r p y | o | c | q] > ").strip()
             except (EOFError, KeyboardInterrupt):
                 break
 
@@ -193,9 +267,30 @@ def main() -> int:
             if line.lower() in ("q", "quit", "exit"):
                 break
 
+            cmd_parts = line.split()
+            cmd_head = cmd_parts[0].lower()
+
+            if cmd_head in ("o", "open"):
+                dist = (
+                    float(cmd_parts[1])
+                    if len(cmd_parts) > 1 and cmd_parts[1].replace(".", "", 1).isdigit()
+                    else GRIPPER_READY_OPEN_M
+                )
+                open_gripper(grasp_driver, distance_m=dist, dry_run=args.dry_run)
+                continue
+
+            if cmd_head in ("c", "close"):
+                force = (
+                    float(cmd_parts[1])
+                    if len(cmd_parts) > 1 and cmd_parts[1].replace(".", "", 1).isdigit()
+                    else GRIPPER_FORCE
+                )
+                close_gripper(grasp_driver, force=force, dry_run=args.dry_run)
+                continue
+
             pose = parse_pose_str(line)
             if pose is None:
-                print("Invalid input. Please enter 6 numbers: x y z roll pitch yaw")
+                print("Invalid input. Enter 6 numbers (x y z roll pitch yaw) or 'o' to open, 'c' to close, 'q' to quit.")
                 print("Example: 0.30 0.00 0.30 0.00 0.70 0.00")
                 continue
 
